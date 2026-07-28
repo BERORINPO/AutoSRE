@@ -150,6 +150,10 @@
         <span class="spinner"></span><span class="muted" id="runningText">AutoSRE が稼働中のサービスを調査しています…</span>
         <span class="muted" id="runClock" style="margin-left:auto;font-family:var(--mono);font-size:12.5px"></span>
       </div>
+      <div id="ambientPaused" class="row hidden" style="margin-top:12px">
+        <span class="muted">操作もイベントも無い状態が続いたため、自動検知の購読を一時停止しました（課金を止めるため）。</span>
+        <button class="btn" onclick="ambientResume()" style="margin-left:auto">観測を再開</button>
+      </div>
     </div>
 
     <div>
@@ -761,15 +765,24 @@ loadConsoleMeta();
 refreshTarget();
 setInterval(refreshTarget, 15000);
 
-// 自動検知の常時観測ストリーム。ページ表示中は常に /events を購読し、
-// サーバ側で Pub/Sub 起点のエージェント実行がブロードキャストされたら、
-// 誰も操作していなくてもこのコンソールのタイムラインが動き出す。
+// 自動検知の常時観測ストリーム。/events を購読していると、Pub/Sub 起点の
+// エージェント実行が始まったときに、誰も操作していなくてもタイムラインが動き出す。
 // EventSource は認証ヘッダを送れないため /events は読み取り専用・無認証で購読する。
-// EventSource は Cloud Run のリクエストタイムアウト後に自動再接続するので問題ない。
-const ambient = new EventSource("/events");
+//
+// コスト規律: この接続は「人が実際に見ている時間」にだけ課金されるべきもの。
+// 以前は開いたタブ 1 枚が 1 日あたり約 85,000 課金インスタンス秒を消費していた
+// （サーバ側が閉じず Cloud Run の 3600 秒タイムアウトまで走り、EventSource が
+// 即座に再接続するため）。サーバ側の寿命上限に加えて、ここで 2 つ止める:
+//   1) タブが非表示になったら切断し、表示に戻ったら再接続する
+//   2) 誰も操作せずイベントも来ない状態が続いたら再接続をやめる（手動で再開可能）
+let ambient = null;
 let ambientRunActive = false; // /events 起点の自動検知ランがタイムラインを保持しているか
-ambient.onmessage = (e)=>{
+let ambientIdleTimer = null;
+const AMBIENT_IDLE_MS = 10 * 60 * 1000; // サーバ側 _SSE_IDLE_CLOSE_S と揃える
+
+function ambientHandle(e){
   let ev; try{ ev = JSON.parse(e.data); }catch(_){ return; }
+  ambientTouch(); // イベント受信は「見ている」証拠
   if(ev.type==="run_started"){
     // 手動実行が進行中なら、周囲の run_started は無視して手動実行を上書きしない。
     if(runInProgress || resetInProgress || approveInProgress) return;
@@ -782,7 +795,53 @@ ambient.onmessage = (e)=>{
     if(ev.type==="done") ambientRunActive = false;
     handleAgentEvent(ev);
   }
-};
+}
+
+function ambientConnect(){
+  if(ambient || document.hidden) return;
+  // 再接続時、EventSource が Last-Event-ID を自動送信するのでサーバが取りこぼしを再送する。
+  ambient = new EventSource("/events");
+  ambient.onmessage = ambientHandle;
+  hideAmbientPaused();
+}
+
+function ambientDisconnect(){
+  if(!ambient) return;
+  ambient.close();
+  ambient = null;
+}
+
+// 無操作・無イベントが続いたら購読をやめる。放置されたタブが課金し続けるのを防ぐ。
+function ambientTouch(){
+  if(ambientIdleTimer) clearTimeout(ambientIdleTimer);
+  ambientIdleTimer = setTimeout(()=>{
+    if(runInProgress || ambientRunActive) { ambientTouch(); return; } // 実行中は止めない
+    ambientDisconnect();
+    showAmbientPaused();
+  }, AMBIENT_IDLE_MS);
+}
+
+function showAmbientPaused(){
+  const el = document.getElementById("ambientPaused");
+  if(el) el.classList.remove("hidden");
+}
+function hideAmbientPaused(){
+  const el = document.getElementById("ambientPaused");
+  if(el) el.classList.add("hidden");
+}
+function ambientResume(){ ambientConnect(); ambientTouch(); }
+
+document.addEventListener("visibilitychange", ()=>{
+  if(document.hidden){ ambientDisconnect(); }
+  else { ambientConnect(); ambientTouch(); }
+});
+window.addEventListener("pagehide", ambientDisconnect);
+["click","keydown"].forEach(t=>document.addEventListener(t, ()=>{
+  if(!ambient && !document.hidden) ambientResume(); else ambientTouch();
+}, {passive:true}));
+
+ambientConnect();
+ambientTouch();
 </script>
 </body>
 </html>

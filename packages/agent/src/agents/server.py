@@ -16,6 +16,7 @@ Env contract (set via `gcloud run deploy --set-env-vars`):
 """
 import asyncio
 import base64
+import collections
 import hmac
 import json
 import os
@@ -449,40 +450,106 @@ _AUTO_COOLDOWN_S = 300
 _console_subscribers: list[asyncio.Queue] = []
 _SUBSCRIBER_QUEUE_MAXSIZE = 100
 
+# A /events connection is closed by the server after this long, so that no single
+# connection can hold an instance for the full Cloud Run request timeout (3600s).
+# Before this existed, one open console tab cost ~85,000 billable instance-seconds
+# per day: the generator never returned, so every connection ran the full 3600s
+# and EventSource immediately reconnected.
+_SSE_MAX_LIFETIME_S = 900.0
+# Closed earlier if nothing at all was broadcast for this long. Heartbeats do not
+# count as activity. Pairs with the console's own idle rule: an unattended tab
+# stops reconnecting, so an abandoned console costs nothing.
+_SSE_IDLE_CLOSE_S = 600.0
+
+# Replay buffer so the deliberate closes above are invisible to the console:
+# on reconnect EventSource sends Last-Event-ID and we resend what it missed.
+_EVENT_RING_MAX = 200
+_EVENT_RING_TTL_S = 900.0
+_event_ring: collections.deque = collections.deque(maxlen=_EVENT_RING_MAX)
+_event_seq = 0
+
 
 def _broadcast(ev: dict) -> None:
     """Fan an event out to every /events subscriber. Never raises into the caller.
 
     Drops the event for any full/broken queue rather than blocking a slow console
     (bounded queue + drop-on-full), so one dead client cannot stall a broadcast."""
+    global _event_seq
+    _event_seq += 1
+    seq = _event_seq
+    _event_ring.append((seq, time.time(), ev))
     for q in list(_console_subscribers):
         try:
-            q.put_nowait(ev)
+            q.put_nowait((seq, ev))
         except Exception:  # noqa: BLE001 - QueueFull or a torn-down queue: skip it
             pass
 
 
+def _parse_last_event_id(raw: str | None) -> int:
+    """Last-Event-ID -> int. Anything unparseable means "replay nothing"."""
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw.strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _replay_since(last_id: int, now: float) -> list[tuple[int, dict]]:
+    """Buffered events newer than last_id that have not aged out.
+
+    last_id == 0 (fresh connection) replays nothing: a new console renders its
+    state from /console-meta, and replaying a stale run would be confusing."""
+    if last_id <= 0:
+        return []
+    return [
+        (seq, ev)
+        for seq, ts, ev in list(_event_ring)
+        if seq > last_id and now - ts <= _EVENT_RING_TTL_S
+    ]
+
+
 @app.get("/events")
-async def events() -> StreamingResponse:
+async def events(request: Request) -> StreamingResponse:
     """Persistent, read-only SSE channel: broadcasts agent-run events (from any source,
     e.g. a Pub/Sub-triggered autonomous run) to every open console on this instance.
 
     Read-only observation -> intentionally unauthenticated (EventSource cannot send
     headers). Each connection gets a bounded queue; a heartbeat comment keeps the
-    connection alive, and the queue is always removed on disconnect (no leak)."""
+    connection alive, and the queue is always removed on disconnect (no leak).
+
+    The connection is bounded (_SSE_MAX_LIFETIME_S / _SSE_IDLE_CLOSE_S) so it can
+    never run to the 3600s Cloud Run request timeout. Reconnects resume from
+    Last-Event-ID, so the console does not miss events across a close."""
+    last_id = _parse_last_event_id(request.headers.get("last-event-id"))
     queue: asyncio.Queue = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_MAXSIZE)
     _console_subscribers.append(queue)
 
     async def gen():
         try:
-            yield "retry: 60000\n\n"
+            # 3s (was 60s): the server now closes connections on purpose, so a
+            # long retry would leave the console blind for a minute each time.
+            yield "retry: 3000\n\n"
+            for seq, ev in _replay_since(last_id, time.time()):
+                yield f"id: {seq}\ndata: {json.dumps(ev)}\n\n"
+            started = time.monotonic()
+            last_activity = started
             while True:
+                now = time.monotonic()
+                remaining = _SSE_MAX_LIFETIME_S - (now - started)
+                if remaining <= 0:
+                    break  # clean close; EventSource reconnects with Last-Event-ID
                 try:
-                    ev = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    seq, ev = await asyncio.wait_for(
+                        queue.get(), timeout=min(15.0, remaining)
+                    )
                 except asyncio.TimeoutError:
+                    if time.monotonic() - last_activity >= _SSE_IDLE_CLOSE_S:
+                        break  # nothing happened for 10 min: stop billing for it
                     yield ": ping\n\n"  # heartbeat: keep the connection warm, avoid busy-loop
                     continue
-                yield f"data: {json.dumps(ev)}\n\n"
+                last_activity = time.monotonic()
+                yield f"id: {seq}\ndata: {json.dumps(ev)}\n\n"
         finally:
             try:
                 _console_subscribers.remove(queue)
