@@ -384,6 +384,8 @@ function finalizeRunningSteps(){
 let runInProgress = false;
 let resetInProgress = false;
 let approveInProgress = false;
+// コストガードで実行が見送られた直後か。done で通知行を消さないために使う。
+let blockedNotice = false;
 
 // 手動実行(/incident/stream)と自動検知(/events)の両方から呼ばれる共有ハンドラ。
 // 従来 runIncident の es.onmessage 本体と完全に同一の描画を行う。
@@ -405,6 +407,21 @@ function handleAgentEvent(ev){
       renderEscalation(d);
     }else if(d.pr_number){ currentPr=d.pr_number;
       document.getElementById("approveWrap").classList.remove("hidden"); }
+  }else if(ev.type==="blocked"){
+    // コストガードが自分で止めた。エラーではないので、そう見えるように描画する。
+    stopRunClock();
+    finalizeRunningSteps();
+    const why = {
+      killswitch:  "停止スイッチが入っているため、実行しませんでした。",
+      daily_limit: "本日の実行予算の上限に達したため、自分で停止しました。",
+      cooldown:    "直前の実行から間もないため、実行を見送りました。",
+      conflict:    "別の実行と競合したため、実行を見送りました。"
+    }[ev.reason] || ("実行を見送りました（"+ev.reason+"）。");
+    document.getElementById("runningText").textContent = "コストガード: " + why;
+    // 直後に done が来るが、この通知は消さずに残す（下の done 分岐で参照する）。
+    blockedNotice = true;
+    const sp = document.querySelector("#running .spinner");
+    if(sp) sp.style.visibility = "hidden";
   }else if(ev.type==="error"){
     stopRunClock();
     finalizeRunningSteps();
@@ -412,7 +429,9 @@ function handleAgentEvent(ev){
   }else if(ev.type==="done"){
     stopRunClock();
     finalizeRunningSteps();
-    document.getElementById("running").classList.add("hidden");
+    // blocked の直後の done では通知行を残す（消すと理由が見えないまま終わる）。
+    if(!blockedNotice) document.getElementById("running").classList.add("hidden");
+    blockedNotice = false;
     runInProgress = false;
     if(!resetInProgress && !approveInProgress) document.getElementById("runBtn").disabled=false;
     // 1 回の診断 = 1 件の学習 (diagnosis 行が記録される)。カウンタをその場で更新。
@@ -428,6 +447,10 @@ function resetTimelineForRun(runningText){
   const tl=document.getElementById("timeline"); tl.innerHTML=""; tl.classList.remove("hidden");
   document.getElementById("running").classList.remove("hidden");
   document.getElementById("runningText").textContent=runningText;
+  // 前回がコストガードで止まっていた場合の残留状態を戻す。
+  blockedNotice = false;
+  const sp = document.querySelector("#running .spinner");
+  if(sp) sp.style.visibility = "";
   startRunClock();
   document.getElementById("diagCard").classList.add("hidden");
   document.getElementById("evidenceCard").classList.add("hidden");

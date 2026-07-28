@@ -98,3 +98,4 @@ jobs:
           python scripts/test_armor_tools_local.py
           python scripts/test_cost_guard_local.py
           python scripts/test_sse_lifecycle_local.py
+          python scripts/test_state_store_local.py

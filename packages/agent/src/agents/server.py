@@ -28,6 +28,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+# Eager (unlike the other agents.* imports, which are lazy to keep startup fast):
+# state_store pulls only stdlib at import time — the storage client is lazy
+# inside it — and it gates every run-starting route, so it is on the hot path.
+from agents import state_store
+
 _UI_HTML = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
 
 app = FastAPI(title="AutoSRE agent-service")
@@ -201,6 +206,17 @@ async def incident(req: IncidentRequest, request: Request) -> dict:
     )
     incident_text += _video_clause(req.video_ref)
     started = time.time()
+    # Operator-initiated: no storm cooldown, but it still spends daily budget and
+    # obeys the kill switch.
+    allowed, reason = _claim_run_slot(started, apply_cooldown=False)
+    if not allowed:
+        return {
+            "steps": [],
+            "outcome": f"blocked_{reason}",
+            "diagnosis": None,
+            "raw_final": "",
+            "error": f"run budget gate: {reason}",
+        }
     try:
         result = await run_incident(incident_text)
     except LlmCallsLimitExceededError as e:
@@ -300,6 +316,14 @@ async def incident_stream(request: Request) -> StreamingResponse:
     async def gen():
         yield "retry: 60000\n\n"
         started = time.time()
+        # Same gate as /incident, reported inside the stream so the console can
+        # render it (a non-SSE error response would surface as a generic
+        # connection failure).
+        allowed, reason = _claim_run_slot(started, apply_cooldown=False)
+        if not allowed:
+            yield f"data: {json.dumps({'type': 'blocked', 'reason': reason})}\n\n"
+            yield 'data: {"type": "done"}\n\n'
+            return
         try:
             async for ev in run_incident_events(incident_text):
                 if ev.get("type") == "final":
@@ -442,6 +466,33 @@ def report_video(request: Request):
 
 _last_auto_trigger = {"ts": 0.0}
 _AUTO_COOLDOWN_S = 300
+
+
+def _claim_run_slot(now: float, apply_cooldown: bool = True) -> tuple[bool, str]:
+    """Rate-limit + budget gate for anything that starts a billable agent run.
+
+    Prefers the durable store (cross-instance cooldown, daily budget, kill
+    switch). The in-process cooldown below is only a fallback: it resets on
+    every cold start, so with min-instances=0 and maxScale>1 it was really a
+    per-instance limit, not a service-wide one.
+
+    apply_cooldown=False for operator-initiated runs: the storm cooldown is
+    there to stop an alert storm becoming a billing storm, not to stop a human
+    pressing the button twice. The daily budget and kill switch still apply.
+    """
+    allowed, reason = state_store.reserve_run(
+        now, cooldown_override=None if apply_cooldown else 0.0
+    )
+    if reason not in ("disabled", "unavailable"):
+        return allowed, reason
+    # Store off or unreachable -> degrade to the historical in-process cooldown
+    # rather than taking the agent offline.
+    if not apply_cooldown:
+        return True, reason
+    if now - _last_auto_trigger["ts"] < _AUTO_COOLDOWN_S:
+        return False, "cooldown"
+    _last_auto_trigger["ts"] = now
+    return True, reason
 
 # In-process broadcast fabric for the persistent /events SSE channel.
 # NOTE: this reaches only consoles connected to the SAME Cloud Run instance. The
@@ -634,9 +685,11 @@ async def pubsub_incident(request: Request) -> dict:
         detail = json.dumps(body)[:1000]
 
     now = time.time()
-    if now - _last_auto_trigger["ts"] < _AUTO_COOLDOWN_S:
-        return {"status": "skipped", "reason": "cooldown"}
-    _last_auto_trigger["ts"] = now
+    allowed, reason = _claim_run_slot(now)
+    if not allowed:
+        # 200 on purpose: Pub/Sub retries non-2xx, and retrying a deliberate
+        # rate-limit decision would be a retry storm on top of a cost guard.
+        return {"status": "skipped", "reason": reason}
     from agents.agent import run_incident_events  # lazy import (matches /incident/stream)
 
     health_url = os.environ.get("TARGET_HEALTH_URL", "")
