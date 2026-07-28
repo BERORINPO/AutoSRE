@@ -188,7 +188,10 @@ async def incident(req: IncidentRequest, request: Request) -> dict:
     # Gate on the console key (no-op when AUTOSRE_CONSOLE_KEY is unset). This endpoint
     # accepts a caller-controlled video_ref, so it must not be an open trigger. (CISO M-2)
     _check_console_key(request)
-    from agents.agent import run_incident  # lazy import (heavy ADK deps, keep startup fast)
+    # lazy imports (heavy ADK deps, keep startup fast)
+    from google.adk.agents.invocation_context import LlmCallsLimitExceededError
+
+    from agents.agent import run_incident
 
     health_url = req.target_health_url or os.environ.get("TARGET_HEALTH_URL", "")
     incident_text = (
@@ -197,7 +200,19 @@ async def incident(req: IncidentRequest, request: Request) -> dict:
     )
     incident_text += _video_clause(req.video_ref)
     started = time.time()
-    result = await run_incident(incident_text)
+    try:
+        result = await run_incident(incident_text)
+    except LlmCallsLimitExceededError as e:
+        # The per-incident LLM call ceiling (agent.run_config) fired. This is a
+        # cost guard doing its job, not a server fault -> report it as an
+        # outcome instead of a 500 so the console can render it.
+        return {
+            "steps": [],
+            "outcome": "aborted_llm_limit",
+            "diagnosis": None,
+            "raw_final": "",
+            "error": str(e),
+        }
     diagnosis = _parse_diagnosis(result["final"])
     # to_thread: the sync BigQuery insert must not block the event loop
     # (a slow insert would freeze /events heartbeats on this single instance).
@@ -264,8 +279,14 @@ def approve(req: ApproveRequest, request: Request) -> dict:
 
 
 @app.get("/incident/stream")
-async def incident_stream() -> StreamingResponse:
-    """Server-Sent Events stream of the agent's steps as they happen (live demo)."""
+async def incident_stream(request: Request) -> StreamingResponse:
+    """Server-Sent Events stream of the agent's steps as they happen (live demo).
+
+    Gated on the console key like every other agent-starting route. EventSource
+    cannot set headers, so the console passes it as ?key= - _check_console_key
+    accepts either credential independently.
+    """
+    _check_console_key(request)
     from agents.agent import run_incident_events
 
     health_url = os.environ.get("TARGET_HEALTH_URL", "")

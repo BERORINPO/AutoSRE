@@ -8,13 +8,14 @@ Kept separate from server.py so it can be unit-tested locally without HTTP.
 import os
 import uuid
 
-from google.adk.agents import LlmAgent
+from google.adk.agents import LlmAgent, RunConfig
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
 from agents.case_store import recall_similar_cases
 from agents.github_tools import allowed_env_vars, get_user_reviews, open_pull_request
+from agents.limits import max_llm_calls
 from agents.tools import (
     get_recent_logs,
     get_service_config,
@@ -25,6 +26,15 @@ from agents.video_tools import analyze_report_video
 
 APP_NAME = "autosre"
 DEFAULT_MODEL = os.environ.get("AUTOSRE_MODEL", "gemini-2.5-flash")
+
+def run_config() -> RunConfig:
+    """RunConfig carrying the per-incident LLM call ceiling.
+
+    Without this ADK runs with max_llm_calls=500, i.e. one incident has no
+    practical cost bound. The limit itself lives in agents.limits so the offline
+    smoke gate can test it without importing ADK.
+    """
+    return RunConfig(max_llm_calls=max_llm_calls())
 
 # The allowed remediation set is injected into the instruction so the model's
 # remediation policy matches the hard backstop enforced in
@@ -178,7 +188,10 @@ async def run_incident(incident_text: str, model: str = DEFAULT_MODEL) -> dict:
     steps: list[dict] = []
     final_text = ""
     async for event in runner.run_async(
-        user_id=user_id, session_id=session_id, new_message=message
+        user_id=user_id,
+        session_id=session_id,
+        new_message=message,
+        run_config=run_config(),
     ):
         for call in event.get_function_calls() or []:
             steps.append({"type": "tool_call", "name": call.name, "args": dict(call.args or {})})
@@ -216,7 +229,10 @@ async def run_incident_events(incident_text: str, model: str = DEFAULT_MODEL):
     )
     message = types.Content(role="user", parts=[types.Part(text=incident_text)])
     async for event in runner.run_async(
-        user_id=user_id, session_id=session_id, new_message=message
+        user_id=user_id,
+        session_id=session_id,
+        new_message=message,
+        run_config=run_config(),
     ):
         for call in event.get_function_calls() or []:
             yield {

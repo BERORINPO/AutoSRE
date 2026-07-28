@@ -444,10 +444,16 @@ function runIncident(){
   resetTimelineForRun("AutoSRE が稼働中のサービスを調査しています…");
 
   // エージェントの各ステップをリアルタイム配信（Server-Sent Events）
-  const source = new EventSource("/incident/stream");
+  // /incident/stream は key ゲート付き。EventSource はヘッダを送れないので ?key= を付ける
+  // （/report-video と同じ前例）。CONSOLE_KEY は URL 由来だが encodeURIComponent で安全化。
+  const source = new EventSource(
+    "/incident/stream" + (CONSOLE_KEY ? "?key="+encodeURIComponent(CONSOLE_KEY) : "")
+  );
   es = source;
+  let gotMessage = false;
   source.onmessage = (e)=>{
     if(es!==source) return;
+    gotMessage = true;
     let ev; try{ ev = JSON.parse(e.data); }catch(_){ return; }
     if(ev.type==="done"){
       source.close();
@@ -459,6 +465,13 @@ function runIncident(){
     if(es!==source) return;
     source.close(); es=null; stopRunClock(); finalizeRunningSteps();
     document.getElementById("running").classList.add("hidden");
+    // 1 件も受信せずに閉じた = HTTP エラー（401 等）。ブラウザは非 2xx では再接続しない。
+    // ネットワーク断なら再接続を試みるため、この分岐には入らない。
+    if(!gotMessage){
+      const tl = document.getElementById("timeline");
+      if(tl) tl.innerHTML =
+        "<span class='muted'>ストリームを開始できませんでした。認証キーが無効な可能性があります（URL の ?key= を確認してください）。</span>";
+    }
     runInProgress = false;
     if(!resetInProgress && !approveInProgress) btn.disabled=false;
   };
