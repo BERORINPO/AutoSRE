@@ -1,12 +1,18 @@
 name: judging-window-sweep
 
-# Daily passive sweep during the judging window (Jul 13-24, 09:00 JST).
+# Daily passive sweep at 09:00 JST, July through August.
+#
+# The window used to be the judging period alone (Jul 13-24), which meant the
+# sweep stopped on Jul 25 and would not have run on the Aug 19 finals — the one
+# day the deployment has to be up. External liveness that expires before the
+# event it exists for is not liveness.
+#
 # Complements the 5-min Cloud Monitoring uptime check on /health by also
 # verifying /smoke wiring, target armed state, and the console auth gate.
-# Read-only: no deploys, no writes — safe under the judging-window freeze.
+# Read-only: no deploys, no writes.
 on:
   schedule:
-    - cron: '0 0 13-24 7 *'
+    - cron: '0 0 * 7,8 *'
   workflow_dispatch:
 
 permissions:
