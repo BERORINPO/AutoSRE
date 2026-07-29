@@ -98,11 +98,36 @@ def get_user_reviews(limit: int = 10) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def apply_env_value(text: str, name: str, value: str) -> tuple[str, str]:
+    """Set name=value in a .env-style file. Returns (new_text, change).
+
+    change is "added" (the variable was absent), "corrected" (it was present
+    with a different value) or "already_correct" (nothing to do). Pure, so the
+    offline smoke gate can cover both failure classes without GitHub.
+
+    Commented-out lines are left alone: a '#' line is documentation, not config,
+    and silently reviving one would be a change nobody reviewed.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped.startswith(f"{name}="):
+            continue
+        if stripped == f"{name}={value}":
+            return text, "already_correct"
+        lines[i] = f"{name}={value}"
+        return "\n".join(lines) + "\n", "corrected"
+    return text.rstrip("\n") + f"\n{name}={value}\n", "added"
+
+
 def open_pull_request(missing_env_var: str, root_cause: str) -> dict:
-    """Open a real GitHub pull request that fixes the incident by restoring a missing environment variable in the target deploy config.
+    """Open a real GitHub pull request that fixes the incident by setting an environment variable to its correct value in the target deploy config.
+
+    Handles both failure classes: a variable that is missing entirely, and a
+    variable that is present but set to an unusable value.
 
     Args:
-        missing_env_var: the environment variable to restore, e.g. "DATABASE_URL".
+        missing_env_var: the environment variable to fix, e.g. "DATABASE_URL".
         root_cause: a one-line root-cause summary for the PR description.
     """
     try:
@@ -131,8 +156,17 @@ def open_pull_request(missing_env_var: str, root_cause: str) -> dict:
             )
             file_sha = f["sha"]
             current = base64.b64decode(f["content"]).decode("utf-8")
-            if f"{missing_env_var}=" in current:
-                return {"ok": False, "error": f"{missing_env_var} already present in {CONFIG_PATH}"}
+            new_content, change = apply_env_value(current, missing_env_var, env_value)
+            if change == "already_correct":
+                # The config is already what recovery would write, so a PR would
+                # be a no-op. The incident is real but its cause is elsewhere ->
+                # the agent should escalate rather than open an empty PR.
+                return {
+                    "ok": False,
+                    "error": f"{missing_env_var} is already set to the canonical value in "
+                    f"{CONFIG_PATH}; the config is not the cause - refusing to open an "
+                    f"empty PR",
+                }
 
             # Idempotent for repeated demo runs: drop any stale branch first.
             c.delete(f"/repos/{repo}/git/refs/heads/{branch}")
@@ -141,21 +175,28 @@ def open_pull_request(missing_env_var: str, root_cause: str) -> dict:
                 json={"ref": f"refs/heads/{branch}", "sha": base_sha},
             ).raise_for_status()
 
-            new_content = current.rstrip("\n") + f"\n{missing_env_var}={env_value}\n"
+            verb = "restore" if change == "added" else "correct"
+            title = f"fix: {verb} {missing_env_var} to recover sida-target"
             c.put(
                 f"/repos/{repo}/contents/{CONFIG_PATH}",
                 json={
-                    "message": f"fix: restore {missing_env_var} to recover sida-target",
+                    "message": title,
                     "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"),
                     "sha": file_sha,
                     "branch": branch,
                 },
             ).raise_for_status()
 
+            fix_line = (
+                f"**Fix:** restore `{missing_env_var}` in `{CONFIG_PATH}` (it was missing)."
+                if change == "added"
+                else f"**Fix:** correct the value of `{missing_env_var}` in `{CONFIG_PATH}` "
+                f"(it was set, but not to a usable value)."
+            )
             pr_body = (
                 "## AutoSRE automated fix\n\n"
                 f"**Root cause:** {root_cause}\n\n"
-                f"**Fix:** restore `{missing_env_var}` in `{CONFIG_PATH}`.\n\n"
+                f"{fix_line}\n\n"
                 "Opened autonomously by AutoSRE after investigating the live Cloud Run "
                 "status, logs, and deployed config. Merge + redeploy require human approval."
             )
@@ -163,7 +204,7 @@ def open_pull_request(missing_env_var: str, root_cause: str) -> dict:
                 c.post(
                     f"/repos/{repo}/pulls",
                     json={
-                        "title": f"fix: restore {missing_env_var} to recover sida-target",
+                        "title": title,
                         "head": branch,
                         "base": "main",
                         "body": pr_body,

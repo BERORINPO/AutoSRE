@@ -96,3 +96,8 @@ jobs:
           python scripts/test_case_store_local.py
           python scripts/test_video_tools_local.py
           python scripts/test_armor_tools_local.py
+          python scripts/test_cost_guard_local.py
+          python scripts/test_sse_lifecycle_local.py
+          python scripts/test_state_store_local.py
+          python scripts/test_env_patch_local.py
+          python scripts/test_cost_accounting_local.py
