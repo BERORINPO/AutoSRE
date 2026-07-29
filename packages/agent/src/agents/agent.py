@@ -14,6 +14,7 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
 from agents.case_store import recall_similar_cases
+from agents.cost import RunCost
 from agents.github_tools import allowed_env_vars, get_user_reviews, open_pull_request
 from agents.limits import max_llm_calls
 from agents.tools import (
@@ -210,12 +211,14 @@ async def run_incident(incident_text: str, model: str = DEFAULT_MODEL) -> dict:
     message = types.Content(role="user", parts=[types.Part(text=incident_text)])
     steps: list[dict] = []
     final_text = ""
+    cost = RunCost(model)
     async for event in runner.run_async(
         user_id=user_id,
         session_id=session_id,
         new_message=message,
         run_config=run_config(),
     ):
+        cost.observe(event)
         for call in event.get_function_calls() or []:
             steps.append({"type": "tool_call", "name": call.name, "args": dict(call.args or {})})
         for resp in event.get_function_responses() or []:
@@ -234,7 +237,7 @@ async def run_incident(incident_text: str, model: str = DEFAULT_MODEL) -> dict:
             steps.append(step)
         if event.is_final_response() and event.content and event.content.parts:
             final_text = "".join(p.text or "" for p in event.content.parts)
-    return {"final": final_text, "steps": steps}
+    return {"final": final_text, "steps": steps, "cost": cost.snapshot()}
 
 
 async def run_incident_events(incident_text: str, model: str = DEFAULT_MODEL):
@@ -251,12 +254,14 @@ async def run_incident_events(incident_text: str, model: str = DEFAULT_MODEL):
         app_name=APP_NAME, user_id=user_id, session_id=session_id
     )
     message = types.Content(role="user", parts=[types.Part(text=incident_text)])
+    cost = RunCost(model)
     async for event in runner.run_async(
         user_id=user_id,
         session_id=session_id,
         new_message=message,
         run_config=run_config(),
     ):
+        cost.observe(event)
         for call in event.get_function_calls() or []:
             yield {
                 "type": "tool_call",
@@ -278,7 +283,11 @@ async def run_incident_events(incident_text: str, model: str = DEFAULT_MODEL):
                 ev["summary"] = summary
             yield ev
         if event.is_final_response() and event.content and event.content.parts:
+            # The cost rides out on the terminal event: by here every LLM call of
+            # the run has been observed, and the console already re-renders on
+            # "final", so no extra frame and no extra round trip.
             yield {
                 "type": "final",
                 "final": "".join(p.text or "" for p in event.content.parts),
+                "cost": cost.snapshot(),
             }

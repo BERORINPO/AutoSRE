@@ -155,6 +155,22 @@ def _record_case(diagnosis: dict, source: str, service: str, started_ts: float) 
     from agents.case_store import record_diagnosis  # lazy import (matches codebase style)
 
     record_diagnosis(diagnosis, source=source, service=service, duration_s=time.time() - started_ts)
+
+
+def _log_run_cost(cost: dict | None, source: str) -> None:
+    """Emit this run's own LLM usage as one structured log line.
+
+    The console shows the number to whoever is watching; this line is what makes
+    "median cost over the last N real runs" answerable afterwards without
+    re-running anything. Deliberately not written to the case table - that
+    schema is about incidents, not about our own meter.
+    """
+    if not cost:
+        return
+    try:
+        print(json.dumps({"severity": "INFO", "event": "run_cost", "source": source, **cost}))
+    except Exception:  # noqa: BLE001 - never break a run in order to log it
+        pass
     # A new diagnosis row changes the learned-cases counter -> next /console-meta
     # must recompute (keeps the console's learn-tick fresh despite the TTL cache).
     _invalidate_console_meta()
@@ -328,14 +344,17 @@ async def incident_stream(request: Request) -> StreamingResponse:
             async for ev in run_incident_events(incident_text):
                 if ev.get("type") == "final":
                     diagnosis = _parse_diagnosis(ev["final"])
+                    run_cost = ev.get("cost")
                     await asyncio.to_thread(
                         _record_case, diagnosis, "console", "sida-target", started
                     )
+                    _log_run_cost(run_cost, "console")
                     ev = {
                         "type": "final",
                         "outcome": _classify_outcome(diagnosis),
                         "diagnosis": diagnosis,
                         "raw_final": ev["final"],
+                        "cost": run_cost,
                     }
                 yield f"data: {json.dumps(ev)}\n\n"
         except Exception as e:  # noqa: BLE001
@@ -718,15 +737,18 @@ async def pubsub_incident(request: Request) -> dict:
         async for ev in run_incident_events(incident_text):
             if ev.get("type") == "final":
                 diagnosis = _parse_diagnosis(ev["final"])
+                run_cost = ev.get("cost")
                 await asyncio.to_thread(
                     _record_case, diagnosis, "pubsub", "sida-target", started
                 )
+                _log_run_cost(run_cost, "pubsub")
                 _broadcast(
                     {
                         "type": "final",
                         "outcome": _classify_outcome(diagnosis),
                         "diagnosis": diagnosis,
                         "raw_final": ev["final"],
+                        "cost": run_cost,
                     }
                 )
             else:

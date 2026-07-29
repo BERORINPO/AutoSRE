@@ -187,6 +187,8 @@
       <div class="card hidden" id="diagCard" style="margin-top:16px">
         <h2>診断</h2>
         <div id="diagBody"></div>
+        <div id="runCost" class="hidden"
+          style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line);font-family:var(--mono);font-size:12.5px;color:var(--muted)"></div>
       </div>
 
       <div class="card hidden" id="escalationCard" style="margin-top:16px;border-color:rgba(255,214,102,.45)">
@@ -407,6 +409,9 @@ function handleAgentEvent(ev){
       renderEscalation(d);
     }else if(d.pr_number){ currentPr=d.pr_number;
       document.getElementById("approveWrap").classList.remove("hidden"); }
+    // 承認ゲートを出し切った後に描く。ここで例外が出ても登壇中の承認ボタンを
+    // 巻き添えにしないよう、順序と try/catch の両方で守る。
+    try{ renderRunCost(ev.cost); }catch(e){ console.warn("run cost render failed", e); }
   }else if(ev.type==="blocked"){
     // コストガードが自分で止めた。エラーではないので、そう見えるように描画する。
     stopRunClock();
@@ -747,6 +752,7 @@ async function resetDemo(){
     document.getElementById("timeline").classList.add("hidden");
     document.getElementById("idle").classList.remove("hidden");
     document.getElementById("diagCard").classList.add("hidden");
+    document.getElementById("runCost").classList.add("hidden");
     document.getElementById("evidenceCard").classList.add("hidden");
     document.getElementById("approveWrap").classList.add("hidden");
     document.getElementById("recoverCard").classList.add("hidden");
@@ -763,6 +769,24 @@ async function resetDemo(){
     runBtn.disabled=false;
     b.disabled=false; b.textContent=t;
   }
+}
+
+// このランが自分でいくら使ったかを 1 行で出す。
+// トークン数は実測、金額は公開単価からの「算出」なので、行内にそう明記する。
+// textContent で入れるので HTML エスケープは不要。
+function renderRunCost(c){
+  const el = document.getElementById("runCost");
+  if(!el || !c) return;
+  const n = v => (Number(v)||0).toLocaleString("ja-JP");
+  let s = "この診断 1 件 · 入力 " + n(c.input_tokens) + " tok / 出力 " + n(c.output_tokens)
+        + " tok / LLM " + n(c.llm_calls) + " 回";
+  if(c.priced && typeof c.usd === "number"){
+    s += " · $" + c.usd.toFixed(4) + "（" + String(c.pricing_asof||"") + " の公開単価より算出、請求実額ではありません）";
+  }
+  // 内訳の和がモデル申告の合計と食い違う = 二重計上か未知の項目。黙って出さない。
+  if(c.accounted === false){ s += " ※内訳が合計と一致していません"; }
+  el.textContent = s;
+  el.classList.remove("hidden");
 }
 
 function escapeHtml(s){ return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
