@@ -16,6 +16,7 @@ Env contract (set via `gcloud run deploy --set-env-vars`):
 """
 import asyncio
 import base64
+import collections
 import hmac
 import json
 import os
@@ -26,6 +27,11 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
+
+# Eager (unlike the other agents.* imports, which are lazy to keep startup fast):
+# state_store pulls only stdlib at import time — the storage client is lazy
+# inside it — and it gates every run-starting route, so it is on the hot path.
+from agents import state_store
 
 _UI_HTML = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
 
@@ -149,6 +155,22 @@ def _record_case(diagnosis: dict, source: str, service: str, started_ts: float) 
     from agents.case_store import record_diagnosis  # lazy import (matches codebase style)
 
     record_diagnosis(diagnosis, source=source, service=service, duration_s=time.time() - started_ts)
+
+
+def _log_run_cost(cost: dict | None, source: str) -> None:
+    """Emit this run's own LLM usage as one structured log line.
+
+    The console shows the number to whoever is watching; this line is what makes
+    "median cost over the last N real runs" answerable afterwards without
+    re-running anything. Deliberately not written to the case table - that
+    schema is about incidents, not about our own meter.
+    """
+    if not cost:
+        return
+    try:
+        print(json.dumps({"severity": "INFO", "event": "run_cost", "source": source, **cost}))
+    except Exception:  # noqa: BLE001 - never break a run in order to log it
+        pass
     # A new diagnosis row changes the learned-cases counter -> next /console-meta
     # must recompute (keeps the console's learn-tick fresh despite the TTL cache).
     _invalidate_console_meta()
@@ -188,7 +210,10 @@ async def incident(req: IncidentRequest, request: Request) -> dict:
     # Gate on the console key (no-op when AUTOSRE_CONSOLE_KEY is unset). This endpoint
     # accepts a caller-controlled video_ref, so it must not be an open trigger. (CISO M-2)
     _check_console_key(request)
-    from agents.agent import run_incident  # lazy import (heavy ADK deps, keep startup fast)
+    # lazy imports (heavy ADK deps, keep startup fast)
+    from google.adk.agents.invocation_context import LlmCallsLimitExceededError
+
+    from agents.agent import run_incident
 
     health_url = req.target_health_url or os.environ.get("TARGET_HEALTH_URL", "")
     incident_text = (
@@ -197,7 +222,30 @@ async def incident(req: IncidentRequest, request: Request) -> dict:
     )
     incident_text += _video_clause(req.video_ref)
     started = time.time()
-    result = await run_incident(incident_text)
+    # Operator-initiated: no storm cooldown, but it still spends daily budget and
+    # obeys the kill switch.
+    allowed, reason = _claim_run_slot(started, apply_cooldown=False)
+    if not allowed:
+        return {
+            "steps": [],
+            "outcome": f"blocked_{reason}",
+            "diagnosis": None,
+            "raw_final": "",
+            "error": f"run budget gate: {reason}",
+        }
+    try:
+        result = await run_incident(incident_text)
+    except LlmCallsLimitExceededError as e:
+        # The per-incident LLM call ceiling (agent.run_config) fired. This is a
+        # cost guard doing its job, not a server fault -> report it as an
+        # outcome instead of a 500 so the console can render it.
+        return {
+            "steps": [],
+            "outcome": "aborted_llm_limit",
+            "diagnosis": None,
+            "raw_final": "",
+            "error": str(e),
+        }
     diagnosis = _parse_diagnosis(result["final"])
     # to_thread: the sync BigQuery insert must not block the event loop
     # (a slow insert would freeze /events heartbeats on this single instance).
@@ -264,8 +312,14 @@ def approve(req: ApproveRequest, request: Request) -> dict:
 
 
 @app.get("/incident/stream")
-async def incident_stream() -> StreamingResponse:
-    """Server-Sent Events stream of the agent's steps as they happen (live demo)."""
+async def incident_stream(request: Request) -> StreamingResponse:
+    """Server-Sent Events stream of the agent's steps as they happen (live demo).
+
+    Gated on the console key like every other agent-starting route. EventSource
+    cannot set headers, so the console passes it as ?key= - _check_console_key
+    accepts either credential independently.
+    """
+    _check_console_key(request)
     from agents.agent import run_incident_events
 
     health_url = os.environ.get("TARGET_HEALTH_URL", "")
@@ -278,18 +332,29 @@ async def incident_stream() -> StreamingResponse:
     async def gen():
         yield "retry: 60000\n\n"
         started = time.time()
+        # Same gate as /incident, reported inside the stream so the console can
+        # render it (a non-SSE error response would surface as a generic
+        # connection failure).
+        allowed, reason = _claim_run_slot(started, apply_cooldown=False)
+        if not allowed:
+            yield f"data: {json.dumps({'type': 'blocked', 'reason': reason})}\n\n"
+            yield 'data: {"type": "done"}\n\n'
+            return
         try:
             async for ev in run_incident_events(incident_text):
                 if ev.get("type") == "final":
                     diagnosis = _parse_diagnosis(ev["final"])
+                    run_cost = ev.get("cost")
                     await asyncio.to_thread(
                         _record_case, diagnosis, "console", "sida-target", started
                     )
+                    _log_run_cost(run_cost, "console")
                     ev = {
                         "type": "final",
                         "outcome": _classify_outcome(diagnosis),
                         "diagnosis": diagnosis,
                         "raw_final": ev["final"],
+                        "cost": run_cost,
                     }
                 yield f"data: {json.dumps(ev)}\n\n"
         except Exception as e:  # noqa: BLE001
@@ -421,6 +486,33 @@ def report_video(request: Request):
 _last_auto_trigger = {"ts": 0.0}
 _AUTO_COOLDOWN_S = 300
 
+
+def _claim_run_slot(now: float, apply_cooldown: bool = True) -> tuple[bool, str]:
+    """Rate-limit + budget gate for anything that starts a billable agent run.
+
+    Prefers the durable store (cross-instance cooldown, daily budget, kill
+    switch). The in-process cooldown below is only a fallback: it resets on
+    every cold start, so with min-instances=0 and maxScale>1 it was really a
+    per-instance limit, not a service-wide one.
+
+    apply_cooldown=False for operator-initiated runs: the storm cooldown is
+    there to stop an alert storm becoming a billing storm, not to stop a human
+    pressing the button twice. The daily budget and kill switch still apply.
+    """
+    allowed, reason = state_store.reserve_run(
+        now, cooldown_override=None if apply_cooldown else 0.0
+    )
+    if reason not in ("disabled", "unavailable"):
+        return allowed, reason
+    # Store off or unreachable -> degrade to the historical in-process cooldown
+    # rather than taking the agent offline.
+    if not apply_cooldown:
+        return True, reason
+    if now - _last_auto_trigger["ts"] < _AUTO_COOLDOWN_S:
+        return False, "cooldown"
+    _last_auto_trigger["ts"] = now
+    return True, reason
+
 # In-process broadcast fabric for the persistent /events SSE channel.
 # NOTE: this reaches only consoles connected to the SAME Cloud Run instance. The
 # demo runs a single instance (min-instances=0 + a ~5-min warm-ping), which is
@@ -428,40 +520,106 @@ _AUTO_COOLDOWN_S = 300
 _console_subscribers: list[asyncio.Queue] = []
 _SUBSCRIBER_QUEUE_MAXSIZE = 100
 
+# A /events connection is closed by the server after this long, so that no single
+# connection can hold an instance for the full Cloud Run request timeout (3600s).
+# Before this existed, one open console tab cost ~85,000 billable instance-seconds
+# per day: the generator never returned, so every connection ran the full 3600s
+# and EventSource immediately reconnected.
+_SSE_MAX_LIFETIME_S = 900.0
+# Closed earlier if nothing at all was broadcast for this long. Heartbeats do not
+# count as activity. Pairs with the console's own idle rule: an unattended tab
+# stops reconnecting, so an abandoned console costs nothing.
+_SSE_IDLE_CLOSE_S = 600.0
+
+# Replay buffer so the deliberate closes above are invisible to the console:
+# on reconnect EventSource sends Last-Event-ID and we resend what it missed.
+_EVENT_RING_MAX = 200
+_EVENT_RING_TTL_S = 900.0
+_event_ring: collections.deque = collections.deque(maxlen=_EVENT_RING_MAX)
+_event_seq = 0
+
 
 def _broadcast(ev: dict) -> None:
     """Fan an event out to every /events subscriber. Never raises into the caller.
 
     Drops the event for any full/broken queue rather than blocking a slow console
     (bounded queue + drop-on-full), so one dead client cannot stall a broadcast."""
+    global _event_seq
+    _event_seq += 1
+    seq = _event_seq
+    _event_ring.append((seq, time.time(), ev))
     for q in list(_console_subscribers):
         try:
-            q.put_nowait(ev)
+            q.put_nowait((seq, ev))
         except Exception:  # noqa: BLE001 - QueueFull or a torn-down queue: skip it
             pass
 
 
+def _parse_last_event_id(raw: str | None) -> int:
+    """Last-Event-ID -> int. Anything unparseable means "replay nothing"."""
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw.strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _replay_since(last_id: int, now: float) -> list[tuple[int, dict]]:
+    """Buffered events newer than last_id that have not aged out.
+
+    last_id == 0 (fresh connection) replays nothing: a new console renders its
+    state from /console-meta, and replaying a stale run would be confusing."""
+    if last_id <= 0:
+        return []
+    return [
+        (seq, ev)
+        for seq, ts, ev in list(_event_ring)
+        if seq > last_id and now - ts <= _EVENT_RING_TTL_S
+    ]
+
+
 @app.get("/events")
-async def events() -> StreamingResponse:
+async def events(request: Request) -> StreamingResponse:
     """Persistent, read-only SSE channel: broadcasts agent-run events (from any source,
     e.g. a Pub/Sub-triggered autonomous run) to every open console on this instance.
 
     Read-only observation -> intentionally unauthenticated (EventSource cannot send
     headers). Each connection gets a bounded queue; a heartbeat comment keeps the
-    connection alive, and the queue is always removed on disconnect (no leak)."""
+    connection alive, and the queue is always removed on disconnect (no leak).
+
+    The connection is bounded (_SSE_MAX_LIFETIME_S / _SSE_IDLE_CLOSE_S) so it can
+    never run to the 3600s Cloud Run request timeout. Reconnects resume from
+    Last-Event-ID, so the console does not miss events across a close."""
+    last_id = _parse_last_event_id(request.headers.get("last-event-id"))
     queue: asyncio.Queue = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_MAXSIZE)
     _console_subscribers.append(queue)
 
     async def gen():
         try:
-            yield "retry: 60000\n\n"
+            # 3s (was 60s): the server now closes connections on purpose, so a
+            # long retry would leave the console blind for a minute each time.
+            yield "retry: 3000\n\n"
+            for seq, ev in _replay_since(last_id, time.time()):
+                yield f"id: {seq}\ndata: {json.dumps(ev)}\n\n"
+            started = time.monotonic()
+            last_activity = started
             while True:
+                now = time.monotonic()
+                remaining = _SSE_MAX_LIFETIME_S - (now - started)
+                if remaining <= 0:
+                    break  # clean close; EventSource reconnects with Last-Event-ID
                 try:
-                    ev = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    seq, ev = await asyncio.wait_for(
+                        queue.get(), timeout=min(15.0, remaining)
+                    )
                 except asyncio.TimeoutError:
+                    if time.monotonic() - last_activity >= _SSE_IDLE_CLOSE_S:
+                        break  # nothing happened for 10 min: stop billing for it
                     yield ": ping\n\n"  # heartbeat: keep the connection warm, avoid busy-loop
                     continue
-                yield f"data: {json.dumps(ev)}\n\n"
+                last_activity = time.monotonic()
+                yield f"id: {seq}\ndata: {json.dumps(ev)}\n\n"
         finally:
             try:
                 _console_subscribers.remove(queue)
@@ -546,9 +704,11 @@ async def pubsub_incident(request: Request) -> dict:
         detail = json.dumps(body)[:1000]
 
     now = time.time()
-    if now - _last_auto_trigger["ts"] < _AUTO_COOLDOWN_S:
-        return {"status": "skipped", "reason": "cooldown"}
-    _last_auto_trigger["ts"] = now
+    allowed, reason = _claim_run_slot(now)
+    if not allowed:
+        # 200 on purpose: Pub/Sub retries non-2xx, and retrying a deliberate
+        # rate-limit decision would be a retry storm on top of a cost guard.
+        return {"status": "skipped", "reason": reason}
     from agents.agent import run_incident_events  # lazy import (matches /incident/stream)
 
     health_url = os.environ.get("TARGET_HEALTH_URL", "")
@@ -577,15 +737,18 @@ async def pubsub_incident(request: Request) -> dict:
         async for ev in run_incident_events(incident_text):
             if ev.get("type") == "final":
                 diagnosis = _parse_diagnosis(ev["final"])
+                run_cost = ev.get("cost")
                 await asyncio.to_thread(
                     _record_case, diagnosis, "pubsub", "sida-target", started
                 )
+                _log_run_cost(run_cost, "pubsub")
                 _broadcast(
                     {
                         "type": "final",
                         "outcome": _classify_outcome(diagnosis),
                         "diagnosis": diagnosis,
                         "raw_final": ev["final"],
+                        "cost": run_cost,
                     }
                 )
             else:

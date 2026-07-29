@@ -19,8 +19,15 @@ def _health(scn) -> dict:
     if var is None:
         return {"ok": True, "url": _HEALTH_URL, "status_code": 200, "healthy": True,
                 "body": '{"status":"ok"}'}
+    state = scn.env_state.get(var, "absent")
     return {"ok": True, "url": _HEALTH_URL, "status_code": 503, "healthy": False,
-            "body": f'{{"reason":"required env var {var} is not set"}}'}
+            "body": f'{{"reason":"{_bad_reason(var, state)}"}}'}
+
+
+# Class 2: present, non-empty, and unusable. Mirrors target-service's validator
+# (wrong URL scheme), so the agent has to read the value, not just check presence.
+INVALID_VALUE = "mysql://demo:demo@db.internal:3306/app"
+_INVALID_PROBLEM = "expected scheme postgres|postgresql, got 'mysql'"
 
 
 def _config(scn) -> dict:
@@ -30,17 +37,26 @@ def _config(scn) -> dict:
         if state == "present":
             env[var] = f"<value-of-{var.lower()}>"
         elif state == "empty":
-            env[var] = ""  # present in config but empty -> "already present" on PR
+            env[var] = ""
+        elif state == "invalid":
+            env[var] = INVALID_VALUE
         # absent -> not in the dict at all
     return {"ok": True, "service": "sida-target", "image": "sida-target:demo",
             "env_vars": env, "env_var_names": sorted(env.keys())}
 
 
+def _bad_reason(var: str, state: str) -> str:
+    """The message target-service actually emits for this state (verbatim shape)."""
+    if state == "invalid":
+        return f"env var {var} is set but its value is invalid ({_INVALID_PROBLEM})"
+    return f"required env var {var} is not set"
+
+
 def _logs(scn) -> dict:
-    var, _ = _first_bad(scn)
+    var, state = _first_bad(scn)
     entries = []
     if var is not None:
-        entries.append({"severity": "ERROR", "text": f"required env var {var} is not set"})
+        entries.append({"severity": "ERROR", "text": _bad_reason(var, state)})
     for line in scn.stale_error_logs:  # old ERRORs that persist even when healthy
         sev = "ERROR" if line.upper().startswith("ERROR") else "WARN"
         entries.append({"severity": sev, "text": line})
@@ -117,14 +133,22 @@ def build_mock_tools(scn, memory_arm: str = "off") -> dict:
     def recall_similar_cases(service_name):  # noqa: ARG001
         return _recall(scn, memory_arm)
 
-    cfg_names_upper = {k.upper() for k in cfg["env_vars"]}
+    states_upper = {k.upper(): v for k, v in scn.env_state.items()}
 
     def open_pull_request(missing_env_var, root_cause):  # noqa: ARG001
         var = str(missing_env_var or "").strip()
         if var.upper() not in allowed:
             return {"ok": False, "error": f"'{var}' is not in the allowed remediation set"}
-        if var.upper() in cfg_names_upper:  # present (incl. empty) -> already present
-            return {"ok": False, "error": f"{var} already present in config"}
+        # Mirrors github_tools.apply_env_value through the injected state, so the
+        # mock can never be more permissive than the real tool:
+        #   absent / empty / invalid -> the config differs from canonical -> PR
+        #   present (canonical)      -> nothing to write -> refuse
+        if states_upper.get(var.upper(), "absent") == "present":
+            return {
+                "ok": False,
+                "error": f"{var} is already set to the canonical value in config; "
+                f"the config is not the cause - refusing to open an empty PR",
+            }
         return {"ok": True, "pr_number": 100, "pr_url": f"https://github.com/x/y/pull/100",
                 "branch": f"autosre/fix-{var.lower()}"}
 

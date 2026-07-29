@@ -150,6 +150,10 @@
         <span class="spinner"></span><span class="muted" id="runningText">AutoSRE が稼働中のサービスを調査しています…</span>
         <span class="muted" id="runClock" style="margin-left:auto;font-family:var(--mono);font-size:12.5px"></span>
       </div>
+      <div id="ambientPaused" class="row hidden" style="margin-top:12px">
+        <span class="muted">操作もイベントも無い状態が続いたため、自動検知の購読を一時停止しました（課金を止めるため）。</span>
+        <button class="btn" onclick="ambientResume()" style="margin-left:auto">観測を再開</button>
+      </div>
     </div>
 
     <div>
@@ -183,6 +187,8 @@
       <div class="card hidden" id="diagCard" style="margin-top:16px">
         <h2>診断</h2>
         <div id="diagBody"></div>
+        <div id="runCost" class="hidden"
+          style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line);font-family:var(--mono);font-size:12.5px;color:var(--muted)"></div>
       </div>
 
       <div class="card hidden" id="escalationCard" style="margin-top:16px;border-color:rgba(255,214,102,.45)">
@@ -380,6 +386,8 @@ function finalizeRunningSteps(){
 let runInProgress = false;
 let resetInProgress = false;
 let approveInProgress = false;
+// コストガードで実行が見送られた直後か。done で通知行を消さないために使う。
+let blockedNotice = false;
 
 // 手動実行(/incident/stream)と自動検知(/events)の両方から呼ばれる共有ハンドラ。
 // 従来 runIncident の es.onmessage 本体と完全に同一の描画を行う。
@@ -401,6 +409,24 @@ function handleAgentEvent(ev){
       renderEscalation(d);
     }else if(d.pr_number){ currentPr=d.pr_number;
       document.getElementById("approveWrap").classList.remove("hidden"); }
+    // 承認ゲートを出し切った後に描く。ここで例外が出ても登壇中の承認ボタンを
+    // 巻き添えにしないよう、順序と try/catch の両方で守る。
+    try{ renderRunCost(ev.cost); }catch(e){ console.warn("run cost render failed", e); }
+  }else if(ev.type==="blocked"){
+    // コストガードが自分で止めた。エラーではないので、そう見えるように描画する。
+    stopRunClock();
+    finalizeRunningSteps();
+    const why = {
+      killswitch:  "停止スイッチが入っているため、実行しませんでした。",
+      daily_limit: "本日の実行予算の上限に達したため、自分で停止しました。",
+      cooldown:    "直前の実行から間もないため、実行を見送りました。",
+      conflict:    "別の実行と競合したため、実行を見送りました。"
+    }[ev.reason] || ("実行を見送りました（"+ev.reason+"）。");
+    document.getElementById("runningText").textContent = "コストガード: " + why;
+    // 直後に done が来るが、この通知は消さずに残す（下の done 分岐で参照する）。
+    blockedNotice = true;
+    const sp = document.querySelector("#running .spinner");
+    if(sp) sp.style.visibility = "hidden";
   }else if(ev.type==="error"){
     stopRunClock();
     finalizeRunningSteps();
@@ -408,7 +434,9 @@ function handleAgentEvent(ev){
   }else if(ev.type==="done"){
     stopRunClock();
     finalizeRunningSteps();
-    document.getElementById("running").classList.add("hidden");
+    // blocked の直後の done では通知行を残す（消すと理由が見えないまま終わる）。
+    if(!blockedNotice) document.getElementById("running").classList.add("hidden");
+    blockedNotice = false;
     runInProgress = false;
     if(!resetInProgress && !approveInProgress) document.getElementById("runBtn").disabled=false;
     // 1 回の診断 = 1 件の学習 (diagnosis 行が記録される)。カウンタをその場で更新。
@@ -424,6 +452,10 @@ function resetTimelineForRun(runningText){
   const tl=document.getElementById("timeline"); tl.innerHTML=""; tl.classList.remove("hidden");
   document.getElementById("running").classList.remove("hidden");
   document.getElementById("runningText").textContent=runningText;
+  // 前回がコストガードで止まっていた場合の残留状態を戻す。
+  blockedNotice = false;
+  const sp = document.querySelector("#running .spinner");
+  if(sp) sp.style.visibility = "";
   startRunClock();
   document.getElementById("diagCard").classList.add("hidden");
   document.getElementById("evidenceCard").classList.add("hidden");
@@ -444,10 +476,16 @@ function runIncident(){
   resetTimelineForRun("AutoSRE が稼働中のサービスを調査しています…");
 
   // エージェントの各ステップをリアルタイム配信（Server-Sent Events）
-  const source = new EventSource("/incident/stream");
+  // /incident/stream は key ゲート付き。EventSource はヘッダを送れないので ?key= を付ける
+  // （/report-video と同じ前例）。CONSOLE_KEY は URL 由来だが encodeURIComponent で安全化。
+  const source = new EventSource(
+    "/incident/stream" + (CONSOLE_KEY ? "?key="+encodeURIComponent(CONSOLE_KEY) : "")
+  );
   es = source;
+  let gotMessage = false;
   source.onmessage = (e)=>{
     if(es!==source) return;
+    gotMessage = true;
     let ev; try{ ev = JSON.parse(e.data); }catch(_){ return; }
     if(ev.type==="done"){
       source.close();
@@ -459,6 +497,13 @@ function runIncident(){
     if(es!==source) return;
     source.close(); es=null; stopRunClock(); finalizeRunningSteps();
     document.getElementById("running").classList.add("hidden");
+    // 1 件も受信せずに閉じた = HTTP エラー（401 等）。ブラウザは非 2xx では再接続しない。
+    // ネットワーク断なら再接続を試みるため、この分岐には入らない。
+    if(!gotMessage){
+      const tl = document.getElementById("timeline");
+      if(tl) tl.innerHTML =
+        "<span class='muted'>ストリームを開始できませんでした。認証キーが無効な可能性があります（URL の ?key= を確認してください）。</span>";
+    }
     runInProgress = false;
     if(!resetInProgress && !approveInProgress) btn.disabled=false;
   };
@@ -707,6 +752,7 @@ async function resetDemo(){
     document.getElementById("timeline").classList.add("hidden");
     document.getElementById("idle").classList.remove("hidden");
     document.getElementById("diagCard").classList.add("hidden");
+    document.getElementById("runCost").classList.add("hidden");
     document.getElementById("evidenceCard").classList.add("hidden");
     document.getElementById("approveWrap").classList.add("hidden");
     document.getElementById("recoverCard").classList.add("hidden");
@@ -723,6 +769,24 @@ async function resetDemo(){
     runBtn.disabled=false;
     b.disabled=false; b.textContent=t;
   }
+}
+
+// このランが自分でいくら使ったかを 1 行で出す。
+// トークン数は実測、金額は公開単価からの「算出」なので、行内にそう明記する。
+// textContent で入れるので HTML エスケープは不要。
+function renderRunCost(c){
+  const el = document.getElementById("runCost");
+  if(!el || !c) return;
+  const n = v => (Number(v)||0).toLocaleString("ja-JP");
+  let s = "この診断 1 件 · 入力 " + n(c.input_tokens) + " tok / 出力 " + n(c.output_tokens)
+        + " tok / LLM " + n(c.llm_calls) + " 回";
+  if(c.priced && typeof c.usd === "number"){
+    s += " · $" + c.usd.toFixed(4) + "（" + String(c.pricing_asof||"") + " の公開単価より算出、請求実額ではありません）";
+  }
+  // 内訳の和がモデル申告の合計と食い違う = 二重計上か未知の項目。黙って出さない。
+  if(c.accounted === false){ s += " ※内訳が合計と一致していません"; }
+  el.textContent = s;
+  el.classList.remove("hidden");
 }
 
 function escapeHtml(s){ return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
@@ -748,15 +812,24 @@ loadConsoleMeta();
 refreshTarget();
 setInterval(refreshTarget, 15000);
 
-// 自動検知の常時観測ストリーム。ページ表示中は常に /events を購読し、
-// サーバ側で Pub/Sub 起点のエージェント実行がブロードキャストされたら、
-// 誰も操作していなくてもこのコンソールのタイムラインが動き出す。
+// 自動検知の常時観測ストリーム。/events を購読していると、Pub/Sub 起点の
+// エージェント実行が始まったときに、誰も操作していなくてもタイムラインが動き出す。
 // EventSource は認証ヘッダを送れないため /events は読み取り専用・無認証で購読する。
-// EventSource は Cloud Run のリクエストタイムアウト後に自動再接続するので問題ない。
-const ambient = new EventSource("/events");
+//
+// コスト規律: この接続は「人が実際に見ている時間」にだけ課金されるべきもの。
+// 以前は開いたタブ 1 枚が 1 日あたり約 85,000 課金インスタンス秒を消費していた
+// （サーバ側が閉じず Cloud Run の 3600 秒タイムアウトまで走り、EventSource が
+// 即座に再接続するため）。サーバ側の寿命上限に加えて、ここで 2 つ止める:
+//   1) タブが非表示になったら切断し、表示に戻ったら再接続する
+//   2) 誰も操作せずイベントも来ない状態が続いたら再接続をやめる（手動で再開可能）
+let ambient = null;
 let ambientRunActive = false; // /events 起点の自動検知ランがタイムラインを保持しているか
-ambient.onmessage = (e)=>{
+let ambientIdleTimer = null;
+const AMBIENT_IDLE_MS = 10 * 60 * 1000; // サーバ側 _SSE_IDLE_CLOSE_S と揃える
+
+function ambientHandle(e){
   let ev; try{ ev = JSON.parse(e.data); }catch(_){ return; }
+  ambientTouch(); // イベント受信は「見ている」証拠
   if(ev.type==="run_started"){
     // 手動実行が進行中なら、周囲の run_started は無視して手動実行を上書きしない。
     if(runInProgress || resetInProgress || approveInProgress) return;
@@ -769,7 +842,53 @@ ambient.onmessage = (e)=>{
     if(ev.type==="done") ambientRunActive = false;
     handleAgentEvent(ev);
   }
-};
+}
+
+function ambientConnect(){
+  if(ambient || document.hidden) return;
+  // 再接続時、EventSource が Last-Event-ID を自動送信するのでサーバが取りこぼしを再送する。
+  ambient = new EventSource("/events");
+  ambient.onmessage = ambientHandle;
+  hideAmbientPaused();
+}
+
+function ambientDisconnect(){
+  if(!ambient) return;
+  ambient.close();
+  ambient = null;
+}
+
+// 無操作・無イベントが続いたら購読をやめる。放置されたタブが課金し続けるのを防ぐ。
+function ambientTouch(){
+  if(ambientIdleTimer) clearTimeout(ambientIdleTimer);
+  ambientIdleTimer = setTimeout(()=>{
+    if(runInProgress || ambientRunActive) { ambientTouch(); return; } // 実行中は止めない
+    ambientDisconnect();
+    showAmbientPaused();
+  }, AMBIENT_IDLE_MS);
+}
+
+function showAmbientPaused(){
+  const el = document.getElementById("ambientPaused");
+  if(el) el.classList.remove("hidden");
+}
+function hideAmbientPaused(){
+  const el = document.getElementById("ambientPaused");
+  if(el) el.classList.add("hidden");
+}
+function ambientResume(){ ambientConnect(); ambientTouch(); }
+
+document.addEventListener("visibilitychange", ()=>{
+  if(document.hidden){ ambientDisconnect(); }
+  else { ambientConnect(); ambientTouch(); }
+});
+window.addEventListener("pagehide", ambientDisconnect);
+["click","keydown"].forEach(t=>document.addEventListener(t, ()=>{
+  if(!ambient && !document.hidden) ambientResume(); else ambientTouch();
+}, {passive:true}));
+
+ambientConnect();
+ambientTouch();
 </script>
 </body>
 </html>

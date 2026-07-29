@@ -8,13 +8,15 @@ Kept separate from server.py so it can be unit-tested locally without HTTP.
 import os
 import uuid
 
-from google.adk.agents import LlmAgent
+from google.adk.agents import LlmAgent, RunConfig
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
 from agents.case_store import recall_similar_cases
+from agents.cost import RunCost
 from agents.github_tools import allowed_env_vars, get_user_reviews, open_pull_request
+from agents.limits import max_llm_calls
 from agents.tools import (
     get_recent_logs,
     get_service_config,
@@ -25,6 +27,15 @@ from agents.video_tools import analyze_report_video
 
 APP_NAME = "autosre"
 DEFAULT_MODEL = os.environ.get("AUTOSRE_MODEL", "gemini-2.5-flash")
+
+def run_config() -> RunConfig:
+    """RunConfig carrying the per-incident LLM call ceiling.
+
+    Without this ADK runs with max_llm_calls=500, i.e. one incident has no
+    practical cost bound. The limit itself lives in agents.limits so the offline
+    smoke gate can test it without importing ADK.
+    """
+    return RunConfig(max_llm_calls=max_llm_calls())
 
 # The allowed remediation set is injected into the instruction so the model's
 # remediation policy matches the hard backstop enforced in
@@ -64,20 +75,42 @@ CRITICAL grounding rules (do not violate):
 - Past cases from recall_similar_cases are HYPOTHESES, never proof. A remembered root
   cause still requires the same live evidence (logs naming the variable, config showing
   it absent) before you may conclude it. Never open a PR based on memory alone.
-- A "missing environment variable" root cause is valid ONLY if get_service_config confirms that variable is ABSENT and get_recent_logs actually names it. NEVER invent an env var name (for example, do not guess SECRET_KEY) that does not appear in the logs or config.
-- If probe_health returns HTTP 200 (healthy) and the config looks complete, the service is actually healthy: set missing_env_var=null, low confidence, proposed_fix "no action needed - service appears healthy; user reports may be stale", do NOT call open_pull_request, and leave pr_url/pr_number null.
+- There are TWO failure classes, and they are NOT interchangeable. Read the VALUE in
+  get_service_config, not just the list of names:
+    (a) MISSING  - the variable is absent from the config entirely. The logs say it
+        "is not set". The fix adds it.
+    (b) INVALID  - the variable IS present, but its value is unusable (wrong scheme,
+        no host, empty). The logs say it "is set but its value is invalid" and name
+        the problem. The fix REPLACES the value.
+  Do not report (b) as (a). A config that lists every required name can still be the
+  cause: presence is not correctness. Conversely, never claim a variable is missing
+  when get_service_config shows it present.
+- An environment-variable root cause is valid ONLY if get_service_config confirms the
+  variable is absent (class a) or holds a bad value (class b), AND get_recent_logs
+  actually names that variable. NEVER invent an env var name (for example, do not guess
+  SECRET_KEY) that does not appear in the logs or config.
+- If probe_health returns HTTP 200 (healthy) and every required variable is present WITH
+  a usable value, the service is actually healthy: set missing_env_var=null, low
+  confidence, proposed_fix "no action needed - service appears healthy; user reports may
+  be stale", do NOT call open_pull_request, and leave pr_url/pr_number null.
 
-Remediation policy: you may auto-remediate ONLY missing environment variables in
-this allowed set: {allowed_env_vars_text}.
-- If the diagnosed missing env var IS in the allowed set: call
+Remediation policy: you may auto-remediate environment variables in this allowed set,
+and only these: {allowed_env_vars_text}. This applies to BOTH failure classes — a
+variable that is missing and a variable whose value is wrong are both remediable, as
+long as the variable itself is on the list.
+- If the diagnosed env var IS in the allowed set: call
   open_pull_request(missing_env_var, root_cause) EXACTLY ONCE to open a REAL pull
-  request that restores it, set "action":"fix_pr", use the returned pr_url/pr_number,
-  and set "escalation":null.
-- If the diagnosed missing env var is NOT in the allowed set (or open_pull_request
+  request. The tool decides the edit itself — it adds the variable when absent and
+  replaces the value when present — and it always writes the canonical value, which
+  you do not choose and must never guess. Set "action":"fix_pr", use the returned
+  pr_url/pr_number, and set "escalation":null.
+- If the diagnosed env var is NOT in the allowed set (or open_pull_request
   returns a safety-guard refusal): DO NOT open a PR and DO NOT retry. Instead
   ESCALATE to a human operator: set "action":"escalate", leave pr_url/pr_number null,
   and fill "escalation" with a runbook-style manual remediation proposal.
-- If the service is healthy (probe_health 200 / no missing env var): set
+- If open_pull_request refuses because the value is ALREADY the canonical one, the
+  config is not the cause. Do not retry with another variable to force a PR: escalate.
+- If the service is healthy (probe_health 200 / no faulty env var): set
   "action":"none", "escalation":null, and do not call open_pull_request.
 
 When finished, output ONLY a JSON object (no prose, no markdown, no code fences)
@@ -85,7 +118,8 @@ with exactly these keys:
   "root_cause": string,
   "evidence": array of strings (quote the real log lines / config you observed),
   "user_reports_summary": string (what users are reporting, in Japanese),
-  "missing_env_var": string or null,
+  "missing_env_var": string or null (the faulty variable, whether it is absent or set
+    to a bad value; the key name is historical),
   "confidence": number between 0 and 1,
   "proposed_fix": string,
   "user_reply_draft": string (a short Japanese reply reassuring the reporting users; a DRAFT only, do not post it),
@@ -177,9 +211,14 @@ async def run_incident(incident_text: str, model: str = DEFAULT_MODEL) -> dict:
     message = types.Content(role="user", parts=[types.Part(text=incident_text)])
     steps: list[dict] = []
     final_text = ""
+    cost = RunCost(model)
     async for event in runner.run_async(
-        user_id=user_id, session_id=session_id, new_message=message
+        user_id=user_id,
+        session_id=session_id,
+        new_message=message,
+        run_config=run_config(),
     ):
+        cost.observe(event)
         for call in event.get_function_calls() or []:
             steps.append({"type": "tool_call", "name": call.name, "args": dict(call.args or {})})
         for resp in event.get_function_responses() or []:
@@ -198,7 +237,7 @@ async def run_incident(incident_text: str, model: str = DEFAULT_MODEL) -> dict:
             steps.append(step)
         if event.is_final_response() and event.content and event.content.parts:
             final_text = "".join(p.text or "" for p in event.content.parts)
-    return {"final": final_text, "steps": steps}
+    return {"final": final_text, "steps": steps, "cost": cost.snapshot()}
 
 
 async def run_incident_events(incident_text: str, model: str = DEFAULT_MODEL):
@@ -215,9 +254,14 @@ async def run_incident_events(incident_text: str, model: str = DEFAULT_MODEL):
         app_name=APP_NAME, user_id=user_id, session_id=session_id
     )
     message = types.Content(role="user", parts=[types.Part(text=incident_text)])
+    cost = RunCost(model)
     async for event in runner.run_async(
-        user_id=user_id, session_id=session_id, new_message=message
+        user_id=user_id,
+        session_id=session_id,
+        new_message=message,
+        run_config=run_config(),
     ):
+        cost.observe(event)
         for call in event.get_function_calls() or []:
             yield {
                 "type": "tool_call",
@@ -239,7 +283,11 @@ async def run_incident_events(incident_text: str, model: str = DEFAULT_MODEL):
                 ev["summary"] = summary
             yield ev
         if event.is_final_response() and event.content and event.content.parts:
+            # The cost rides out on the terminal event: by here every LLM call of
+            # the run has been observed, and the console already re-renders on
+            # "final", so no extra frame and no extra round trip.
             yield {
                 "type": "final",
                 "final": "".join(p.text or "" for p in event.content.parts),
+                "cost": cost.snapshot(),
             }
