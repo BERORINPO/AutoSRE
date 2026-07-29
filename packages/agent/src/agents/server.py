@@ -384,6 +384,43 @@ def reset(request: Request) -> dict:
     }
 
 
+class KillswitchRequest(BaseModel):
+    tripped: bool
+    reason: str = ""
+
+
+@app.get("/guard")
+def guard_state(request: Request) -> dict:
+    """Cost-guard state: armed or not, today's budget spend, kill switch.
+
+    Worth exposing at all because reserve_run() returns allowed=True with
+    reason="disabled" when AUTOSRE_STATE_URI is unset: an inert guard is
+    indistinguishable from a working one by watching runs succeed. read_state()
+    reports enabled/available separately and never raises, so "unconfigured" and
+    "unreachable" cannot masquerade as a healthy zero.
+
+    Key-gated rather than folded into the unauthenticated /console-meta: "the
+    guard is off" and "the budget is nearly spent" are precisely what someone
+    trying to burn the budget would want to read.
+    """
+    _check_console_key(request)
+    return state_store.read_state()
+
+
+@app.post("/guard/killswitch")
+def guard_killswitch(req: KillswitchRequest, request: Request) -> dict:
+    """Trip or clear the kill switch. Same key gate as /reset.
+
+    The daily-limit self-trip deliberately stays tripped until a human clears
+    it; without this route the only way to clear it was hand-editing the GCS
+    object, which is not something to be doing on stage. `ok` is False when the
+    store is not configured, so a no-op cannot read as a successful clear.
+    """
+    _check_console_key(request)
+    ok = state_store.set_killswitch(req.tripped, req.reason)
+    return {"ok": ok, "requested": req.tripped, "state": state_store.read_state()}
+
+
 @app.get("/user-reports")
 def user_reports() -> dict:
     """Return recent user-reported problems (for the console's 'user voice' panel)."""

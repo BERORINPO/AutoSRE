@@ -44,6 +44,9 @@ GATE = "_check_console_key"
 # rate-limited by the auto-trigger cooldown.
 GATE_EXEMPT_ROUTES = {"/pubsub/incident"}
 
+# Clearing the kill switch re-enables spending, so these have no exempt list.
+KILLSWITCH_MUTATORS = {"set_killswitch"}
+
 results: list[tuple[str, bool, str]] = []
 
 
@@ -178,6 +181,45 @@ def test_route_gates() -> None:
     )
 
 
+# ------------------------------------ guard 2c: the guard's own controls are gated
+def test_killswitch_routes_gated() -> None:
+    """Same "all routes of this class" rule, applied to the kill switch itself.
+
+    A route that can clear the kill switch can turn the daily budget off, so an
+    ungated one is worse than an ungated run: it disables the ceiling rather than
+    spending against it. Written as a class rule for the same reason as
+    test_route_gates - the one route that shipped without a gate was the one
+    nobody wrote a unit test for.
+    """
+    with open(SERVER_PY, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+
+    ks_routes: list[tuple[str, ast.AST]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            path = _route_path(dec)
+            if path is None:
+                continue
+            if KILLSWITCH_MUTATORS & _called_names(node):
+                ks_routes.append((path, node))
+
+    # No route is a valid state too: the rule is "if it exists, it is gated".
+    for path, node in ks_routes:
+        params = {a.arg for a in node.args.args} | {a.arg for a in node.args.kwonlyargs}
+        check(
+            f"{path}: takes a request parameter",
+            "request" in params,
+            f"params={sorted(params)} - without it {GATE}() cannot be called",
+        )
+        check(
+            f"{path}: calls {GATE}()",
+            GATE in _called_names(node),
+            f"calls={sorted(_called_names(node))}",
+        )
+
+
 # --------------------------------------------- guard 2b: run_config is passed
 def test_run_config_wired() -> None:
     with open(AGENT_PY, encoding="utf-8") as fh:
@@ -207,6 +249,7 @@ def test_run_config_wired() -> None:
 def main() -> int:
     test_limits()
     test_route_gates()
+    test_killswitch_routes_gated()
     test_run_config_wired()
 
     passed = sum(1 for _, ok, _ in results if ok)
