@@ -77,9 +77,9 @@ Prerequisites: Terraform >= 1.5, `gcloud` authenticated with a project owner
    `agent_image` / `target_image` variable defaults point:
 
    ```
-   gcloud run deploy sida-target --source services/sida-target \
+   gcloud run deploy sida-target --source services/target-service \
      --project <project_id> --region asia-northeast1
-   gcloud run deploy sida-agent  --source services/sida-agent \
+   gcloud run deploy sida-agent  --source packages/agent \
      --project <project_id> --region asia-northeast1
    ```
 
