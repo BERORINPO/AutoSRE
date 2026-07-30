@@ -113,8 +113,33 @@ Prerequisites: Terraform >= 1.5, `gcloud` authenticated with a project owner
 
 - **Secret value** (`github-pat` version): added with `gcloud`, step 4.
 - **Container images**: built by `gcloud run deploy --source`, step 3.
+- **Report-video bucket + clip** (`gs://<project>-autosre-reports/`): created
+  out-of-band, like the Model Armor template. Only referenced via tfvars.
 - Everything else - services, env vars, secret reference, IAM, Pub/Sub,
   Scheduler, Monitoring - is fully declarative here.
+
+## Reconciling against the live project
+
+The run-guard state bucket was first created with `gcloud`; on the live
+project import it once before applying, or the apply 409s:
+
+```
+terraform import google_storage_bucket.autosre_state bero-devops-agent-autosre-state
+```
+
+The live service also runs with features on that default off here. Apply with
+a tfvars that matches, otherwise the apply strips them from the service:
+
+```
+enable_case_memory  = true
+enable_report_video = true
+report_video_uri    = "gs://bero-devops-agent-autosre-reports/report-recording.mp4"
+report_video_bucket = "gs://bero-devops-agent-autosre-reports"
+```
+
+(`enable_run_guard` already defaults to true - the guard is the spending
+ceiling, and an unset `AUTOSRE_STATE_URI` disables it *silently*: runs still
+answer "allowed". See `docs/cost-guard-runbook.md`.)
 
 ## Notes / deliberate details that mirror the live stack
 
