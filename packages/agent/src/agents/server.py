@@ -347,6 +347,7 @@ async def incident_stream(request: Request) -> StreamingResponse:
             yield f"data: {json.dumps({'type': 'blocked', 'reason': reason})}\n\n"
             yield 'data: {"type": "done"}\n\n'
             return
+        diagnosis: dict = {}
         try:
             async for ev in run_incident_events(incident_text):
                 if ev.get("type") == "final":
@@ -366,6 +367,41 @@ async def incident_stream(request: Request) -> StreamingResponse:
                 yield f"data: {json.dumps(ev)}\n\n"
         except Exception as e:  # noqa: BLE001
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+            yield 'data: {"type": "done"}\n\n'
+            return
+        # Earned autonomy on the demo path. This is the same console the human
+        # would approve in, so the stream narrates each stage live and keeps
+        # the connection warm with comment frames while the pipeline works
+        # (rehearsal alone can take a quiet minute). None = feature off/not
+        # applicable -> the stream ends exactly as it did before this existed.
+        if diagnosis:
+            queue: asyncio.Queue = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def _emit_to_stream(step: dict) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, step)
+
+            pipeline = asyncio.ensure_future(
+                asyncio.to_thread(
+                    _maybe_execute_autonomously,
+                    diagnosis,
+                    "sida-target",
+                    "console",
+                    _emit_to_stream,
+                )
+            )
+            while not (pipeline.done() and queue.empty()):
+                try:
+                    step = await asyncio.wait_for(queue.get(), timeout=5.0)
+                    yield f"data: {json.dumps({'type': 'autonomy_step', **step})}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+            try:
+                audit = pipeline.result()
+            except Exception as e:  # noqa: BLE001 - narrate, never hang the stream
+                audit = {"outcome": "autonomy_error", "error": str(e)[:300]}
+            if audit is not None:
+                yield f"data: {json.dumps({'type': 'autonomy', 'audit': audit})}\n\n"
         yield 'data: {"type": "done"}\n\n'
 
     return StreamingResponse(
@@ -391,7 +427,9 @@ def reset(request: Request) -> dict:
     }
 
 
-def _maybe_execute_autonomously(diagnosis: dict, service_name: str, source: str) -> dict | None:
+def _maybe_execute_autonomously(
+    diagnosis: dict, service_name: str, source: str, emit=None
+) -> dict | None:
     """Earned autonomy: close the loop with NO human click, iff this class earned it.
 
     Runs after a diagnosis produced a fix PR. Every step fails closed to the
@@ -420,6 +458,17 @@ def _maybe_execute_autonomously(diagnosis: dict, service_name: str, source: str)
     if env_var not in allowed_env_vars():
         return None
 
+    def _emit(stage: str, **fields) -> None:
+        """Progress callback for live surfaces (SSE stream / ambient broadcast).
+
+        A broken emitter must never break the recovery it is narrating."""
+        if emit is None:
+            return
+        try:
+            emit({"stage": stage, **fields})
+        except Exception:  # noqa: BLE001
+            pass
+
     demotions = state_store.read_demotions()
     promoted, evidence = autonomy.promoted_for(env_var, demotions)
     result: dict = {
@@ -431,6 +480,15 @@ def _maybe_execute_autonomously(diagnosis: dict, service_name: str, source: str)
     if not promoted:
         result["outcome"] = "gate_kept"
         return result
+    _emit(
+        "engaged",
+        **{
+            "class": result["class"],
+            "successes": evidence.get("successes"),
+            "attempts": evidence.get("attempts"),
+            "wilson_lower_bound": evidence.get("wilson_lower_bound"),
+        },
+    )
 
     from urllib.parse import urlsplit
 
@@ -445,11 +503,14 @@ def _maybe_execute_autonomously(diagnosis: dict, service_name: str, source: str)
 
     value = os.environ.get(f"AUTOSRE_RESTORE_{env_var}", "")
     result["attempted"] = True
+    _emit("rehearsal_started")
     rehearsal = rehearse_env_fix(service_name, env_var, value)
     result["rehearsal"] = rehearsal
     if not rehearsal.get("ok"):
         result["outcome"] = "rehearsal_error_gate_kept"
+        _emit("gate_kept", reason="rehearsal_error")
         return result
+    _emit("rehearsal_deployed", url=rehearsal.get("rehearsal_url", ""))
 
     health_url = os.environ.get("TARGET_HEALTH_URL", "")
     health_path = urlsplit(health_url).path or "/health"
@@ -461,12 +522,16 @@ def _maybe_execute_autonomously(diagnosis: dict, service_name: str, source: str)
         # The fix did not prove itself next door -> nothing was risked, the
         # serving revision never changed, and the PR waits for a human.
         result["outcome"] = "rehearsal_red_gate_kept"
+        _emit("gate_kept", reason="rehearsal_red")
         return result
+    _emit("rehearsal_green")
 
     started = time.time()
     result["merge"] = merge_pull_request(int(pr_number))
+    _emit("merged", pr_number=pr_number)
     promote = promote_rehearsal(service_name)
     result["promote"] = promote
+    _emit("promoted")
     verify = verify_recovery(health_url)
     result["verify"] = verify
     recovered = bool(verify.get("recovered")) and bool(promote.get("ok"))
@@ -476,6 +541,7 @@ def _maybe_execute_autonomously(diagnosis: dict, service_name: str, source: str)
     record_resolution(int(pr_number), recovered, time.time() - started)
     if recovered:
         result["outcome"] = "autonomous_recovery_verified"
+        _emit("verified", status_code=verify.get("status_code"))
     else:
         result["revert"] = revert_traffic(
             service_name, rehearsal["snapshot"]["prev_revision"]
@@ -484,6 +550,7 @@ def _maybe_execute_autonomously(diagnosis: dict, service_name: str, source: str)
             result["class"], reason=f"autonomous verify failed (pr #{pr_number})"
         )
         result["demotion_recorded"] = demoted
+        _emit("reverted_demoted", revert_ok=bool(result["revert"].get("ok")))
         result["outcome"] = "reverted_and_demoted"
         print(
             json.dumps(
@@ -949,7 +1016,11 @@ async def pubsub_incident(request: Request) -> dict:
     # and with a promoted class it now has none after it either. Broadcast the
     # audit so any open console renders the post-hoc record live.
     autonomy_audit = await asyncio.to_thread(
-        _maybe_execute_autonomously, diagnosis, "sida-target", "pubsub"
+        _maybe_execute_autonomously,
+        diagnosis,
+        "sida-target",
+        "pubsub",
+        lambda step: _broadcast({"type": "autonomy_step", **step}),
     )
     if autonomy_audit is not None:
         _broadcast({"type": "autonomy", "audit": autonomy_audit})

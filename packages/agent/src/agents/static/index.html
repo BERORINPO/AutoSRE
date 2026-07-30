@@ -130,6 +130,13 @@
     </div>
   </div>
 
+  <div class="card hidden" id="trustCard" style="margin-bottom:16px">
+    <h2>承認ゲートの信頼台帳 — Earned Autonomy</h2>
+    <div id="trustBody" class="muted">読み込み中…</div>
+    <div class="hint">検証済み成功の Wilson 下限が 0.80 を超えたクラスだけ、承認なしの自律復旧を許可します。
+      統計はゲートを開けられますが、一度の失敗で即降格 — 再開放できるのは人間だけです。</div>
+  </div>
+
   <div class="card" id="userReportsCard" style="margin-bottom:16px">
     <h2>ユーザからの声 <span class="muted" id="urCount"></span></h2>
     <div id="userReports" class="muted">読み込み中…</div>
@@ -246,6 +253,41 @@ function setExpNum(id, v, tick){
   const el = document.getElementById(id);
   el.textContent = (typeof v==="number") ? String(v) : "–";
   if(tick){ el.classList.remove("tickup"); void el.offsetWidth; el.classList.add("tickup"); }
+}
+
+// 信頼台帳カード: /trust (key ゲート付き) を描画。key 無し / 未対応サーバ /
+// 台帳が読めない場合はカードを出さない = 従来コンソールと同一表示。
+async function loadTrust(){
+  if(!CONSOLE_KEY) return;
+  try{
+    const r = await fetch("/trust", {headers: authHeaders()});
+    if(!r.ok) return;
+    const j = await r.json();
+    if(!j.available || !(j.classes||[]).length) return;
+    const card = document.getElementById("trustCard");
+    document.getElementById("trustBody").innerHTML = j.classes.map(c=>{
+      const lb = Number(c.wilson_lower_bound||0), thr = Number(c.threshold||0.8);
+      const pct = Math.round(Math.min(1, lb) * 100);
+      const bar = Math.round(Math.min(1, lb/Math.max(thr,0.01)) * 100);
+      const badge = c.demoted
+        ? "<span style='color:var(--warn);font-weight:600'>降格中 — 人間の再武装待ち</span>"
+        : c.promoted
+          ? "<span style='color:var(--good);font-weight:600'>開放 — 承認なしで復旧可</span>"
+          : "<span class='muted'>ゲート内 — 実績を蓄積中</span>";
+      return "<div style='border:1px solid var(--line);border-radius:6px;padding:10px;margin-bottom:8px'>"+
+        "<div class='row' style='justify-content:space-between;flex-wrap:wrap;gap:6px'>"+
+          "<span><code>"+escapeHtml(String(c.env_var||c.class))+"</code> の復元 · "+
+            "検証済み <b>"+escapeHtml(String(c.successes))+"/"+escapeHtml(String(c.attempts))+"</b></span>"+
+          badge+"</div>"+
+        "<div style='margin-top:8px;background:var(--panel2);border:1px solid var(--line);border-radius:4px;height:10px;position:relative;overflow:hidden'>"+
+          "<div style='width:"+bar+"%;height:100%;background:"+(c.promoted?"var(--good)":"rgba(200,212,235,.45)")+"'></div>"+
+        "</div>"+
+        "<div class='muted' style='font-size:11.5px;margin-top:4px;font-family:var(--mono)'>"+
+          "Wilson 下限 "+lb.toFixed(3)+" / 開放ライン "+thr.toFixed(2)+" ("+pct+"%)</div>"+
+        "</div>";
+    }).join("");
+    card.classList.remove("hidden");
+  }catch(e){ /* 台帳が読めない = カード非表示のまま */ }
 }
 
 // URL の ?key= を一度だけ読む。未指定なら認証ヘッダを付けない（今日と完全に同一の挙動）。
@@ -412,6 +454,10 @@ function handleAgentEvent(ev){
     // 承認ゲートを出し切った後に描く。ここで例外が出ても登壇中の承認ボタンを
     // 巻き添えにしないよう、順序と try/catch の両方で守る。
     try{ renderRunCost(ev.cost); }catch(e){ console.warn("run cost render failed", e); }
+  }else if(ev.type==="autonomy_step"){
+    handleAutonomyStep(ev);
+  }else if(ev.type==="autonomy"){
+    handleAutonomyAudit(ev.audit||{});
   }else if(ev.type==="blocked"){
     // コストガードが自分で止めた。エラーではないので、そう見えるように描画する。
     stopRunClock();
@@ -444,6 +490,64 @@ function handleAgentEvent(ev){
   }
 }
 
+// ---- Earned Autonomy: 自律実行の実況 ----
+// 段階イベント (autonomy_step) をタイムラインに刻む。stage は server 側定数のみ
+// だが、url / 数値は実データ由来なのでエスケープを通す。
+const AUTONOMY_STAGES = {
+  engaged:            (s)=>"承認ゲート通過 — このクラスは実績で開放済み ("+
+                          escapeHtml(String(s.successes??"–"))+"/"+escapeHtml(String(s.attempts??"–"))+
+                          "、Wilson 下限 "+escapeHtml(String(s.wilson_lower_bound??"–"))+")",
+  rehearsal_started:  ()=>"リハーサル: 修正をトラフィック 0% の revision として展開中…",
+  rehearsal_deployed: ()=>"リハーサル revision 準備完了 — tag URL でヘルス検査中…",
+  rehearsal_green:    ()=>"リハーサル 200 — 修正は本番の隣で証明されました",
+  merged:             (s)=>"PR #"+escapeHtml(String(s.pr_number??""))+" を自動マージ",
+  promoted:           ()=>"トラフィック昇格 — 証明済み revision が本番へ",
+  verified:           ()=>"本番 URL で復旧確認 (200) — ここまで人間のクリック 0",
+  gate_kept:          (s)=>"自律実行を中断 ("+escapeHtml(String(s.reason||""))+") — 人間の承認ゲートに戻します",
+  reverted_demoted:   ()=>"検証失敗 — トラフィックを即時巻き戻し、クラスを降格しました"
+};
+let autonomyLiRunning = null;
+function handleAutonomyStep(ev){
+  const fn = AUTONOMY_STAGES[ev.stage];
+  if(!fn) return;
+  if(ev.stage==="engaged"){
+    // 承認ボタンは出さない — このランはゲートを実績で通過している。
+    document.getElementById("approveWrap").classList.add("hidden");
+    document.getElementById("running").classList.remove("hidden");
+  }
+  document.getElementById("runningText").textContent = "自律復旧を実行中…";
+  const tl = document.getElementById("timeline");
+  if(autonomyLiRunning){ autonomyLiRunning.classList.remove("running"); autonomyLiRunning.classList.add("done"); }
+  const li = document.createElement("li"); li.className="step running";
+  const ico = document.createElement("div"); ico.className="ico pr"; ico.textContent="AUTO";
+  const body = document.createElement("div"); body.innerHTML = "<b>"+fn(ev)+"</b>";
+  li.appendChild(ico); li.appendChild(body); tl.appendChild(li);
+  autonomyLiRunning = li;
+  const bad = (ev.stage==="gate_kept" || ev.stage==="reverted_demoted");
+  if(bad){ li.classList.remove("running"); li.classList.add("done"); autonomyLiRunning = null; }
+}
+// 最終監査 (autonomy) — 成功なら復旧/報告カードまで自動で埋める。
+function handleAutonomyAudit(a){
+  if(autonomyLiRunning){ autonomyLiRunning.classList.remove("running"); autonomyLiRunning.classList.add("done"); autonomyLiRunning=null; }
+  loadTrust(); refreshTarget(); loadConsoleMeta(true);
+  if(a.outcome==="autonomous_recovery_verified"){
+    document.getElementById("approveWrap").classList.add("hidden");
+    const rc=document.getElementById("recoverCard"); rc.classList.remove("hidden");
+    document.getElementById("recoverBody").innerHTML =
+      kv("マージ", (a.merge&&a.merge.merged)?"完了 (自動)":"—") +
+      kv("リハーサル", (a.rehearsal_health&&a.rehearsal_health.recovered)?"200 (トラフィック 0% で事前証明)":"—") +
+      kv("復旧確認", (a.verify&&a.verify.recovered)?"200 · 復旧":"—") +
+      "<div class='hint'>この復旧に人間の承認クリックはありません — このクラスは検証済み実績でゲートを通過しています。結果は同じ台帳に記録され、失敗していれば即降格でした。</div>";
+    const fc=document.getElementById("finaleCard"); fc.classList.remove("hidden"); fc.classList.add("flash");
+    document.getElementById("finaleBody").innerHTML =
+      (currentReplyDraft? "<div style='background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:13.5px'>"+escapeHtml(currentReplyDraft)+"</div>" : "")+
+      "<div class='hint'>検知 → 診断 → 修正 → 証明 → 復旧 → 報告。すべて自律、すべて検証付き。</div>";
+  }else if(a.outcome && a.outcome.indexOf("gate_kept")>=0 && currentPr){
+    // fail-closed: PR は残っているので、従来どおり人間の承認に切り替える。
+    document.getElementById("approveWrap").classList.remove("hidden");
+  }
+}
+
 // タイムライン UI を「実行中」状態にリセットする共通処理。
 // 手動実行・自動検知の両方で使う（開始文言だけ引数で差し替え）。
 // 手動 runIncident と完全同一の DOM 操作のみ（今日と同じ挙動）。
@@ -454,6 +558,7 @@ function resetTimelineForRun(runningText){
   document.getElementById("runningText").textContent=runningText;
   // 前回がコストガードで止まっていた場合の残留状態を戻す。
   blockedNotice = false;
+  autonomyLiRunning = null;
   const sp = document.querySelector("#running .spinner");
   if(sp) sp.style.visibility = "";
   startRunClock();
@@ -809,6 +914,7 @@ async function loadUserReports(){
 
 loadUserReports();
 loadConsoleMeta();
+loadTrust();
 refreshTarget();
 setInterval(refreshTarget, 15000);
 
