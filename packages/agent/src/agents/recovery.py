@@ -105,10 +105,32 @@ def rehearse_env_fix(service_name: str, env_var: str, value: str) -> dict:
         op = client.update_service(service=svc)
         op.result(timeout=300)
 
-        svc = client.get_service(name=name)
-        rehearsal_revision = (svc.latest_ready_revision or "").rsplit("/", 1)[-1]
-        if rehearsal_revision == prev_revision:
+        # With traffic pinned to the (already ready) previous revision, the
+        # update operation completes WITHOUT waiting for the new zero-traffic
+        # revision: the service's serving state is already satisfied. So
+        # latest_ready lags - poll latest_created for the new revision's name,
+        # then poll until it is actually ready to serve the tag URL. Found the
+        # hard way: the first live run reported "revision was not created"
+        # while the revision was mid-rollout.
+        rehearsal_revision = ""
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            svc = client.get_service(name=name)
+            created = (svc.latest_created_revision or "").rsplit("/", 1)[-1]
+            if created and created != prev_revision:
+                rehearsal_revision = created
+                break
+            time.sleep(3)
+        if not rehearsal_revision:
             return {"ok": False, "error": "rehearsal revision was not created"}
+        while time.time() < deadline:
+            ready = (svc.latest_ready_revision or "").rsplit("/", 1)[-1]
+            if ready == rehearsal_revision:
+                break
+            time.sleep(3)
+            svc = client.get_service(name=name)
+        # Not-ready past the deadline is not fatal here: the tag health poll
+        # below tolerates a still-rolling revision (non-200 -> retry).
         svc.traffic = [
             pin,
             run_v2.TrafficTarget(
