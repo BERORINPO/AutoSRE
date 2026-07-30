@@ -116,6 +116,39 @@ resource "google_cloud_run_v2_service" "agent" {
         name  = "AUTOSRE_MODEL_ARMOR_TEMPLATE"
         value = var.enable_model_armor ? var.model_armor_template : ""
       }
+      env {
+        # Durable run guard (cooldown / daily budget / kill switch). Empty
+        # disables it - and a disabled guard still answers "run allowed", so
+        # keep this set; see docs/cost-guard-runbook.md. These two were first
+        # added with gcloud and later reconciled here so a terraform apply
+        # cannot silently disarm the guard.
+        name = "AUTOSRE_STATE_URI"
+        value = (
+          var.enable_run_guard
+          ? "gs://${google_storage_bucket.autosre_state.name}/autosre-state.json"
+          : ""
+        )
+      }
+      env {
+        name  = "AUTOSRE_DAILY_RUN_LIMIT"
+        value = var.enable_run_guard ? var.daily_run_limit : ""
+      }
+      env {
+        # Video-attached user reports (default-off staged enablement, same
+        # contract as the other AUTOSRE_* flags). The live demo runs with this
+        # on via tfvars; reconciled here so an apply cannot strip the video
+        # feature the console demo depends on.
+        name  = "AUTOSRE_VIDEO_ENABLED"
+        value = var.enable_report_video ? "1" : ""
+      }
+      env {
+        name  = "AUTOSRE_REPORT_VIDEO_URI"
+        value = var.enable_report_video ? var.report_video_uri : ""
+      }
+      env {
+        name  = "AUTOSRE_VIDEO_BUCKET"
+        value = var.enable_report_video ? var.report_video_bucket : ""
+      }
     }
   }
 
