@@ -28,8 +28,12 @@ compare-and-swap で更新する。Cloud Run は `min-instances=0` / `maxScale=2
 判別するには状態を直接見る:
 
 ```bash
-curl.exe -s "https://sida-agent-860561433627.asia-northeast1.run.app/guard?key=$KEY"
+curl.exe -s -H "Authorization: Bearer $KEY" "https://sida-agent-860561433627.asia-northeast1.run.app/guard"
 ```
+
+**キーは `?key=` ではなくヘッダで渡す。** クエリ文字列はこちら側の Cloud Run
+request log に URL ごと記録されるので、キーが自分のログに残る。`?key=` を残してあるのは
+ヘッダを送れない EventSource (`/incident/stream`) のためで、手で叩くときに使う理由はない。
 
 読み方:
 
@@ -37,8 +41,12 @@ curl.exe -s "https://sida-agent-860561433627.asia-northeast1.run.app/guard?key=$
 |---|---|
 | `"enabled": true, "available": true` | ✅ 正常に武装している |
 | `"enabled": false` | ❌ **ガード無効** (`AUTOSRE_STATE_URI` 未設定) |
-| `"enabled": true, "available": false` | ⚠ 設定はあるが GCS に届いていない (この間は実行が素通りする) |
+| `"enabled": true, "available": false` | ⚠ バケット不在・権限不足で GCS の状態が読めない (この間は実行が素通りする) |
 | `"killswitch": {"tripped": true}` | 🛑 停止中。Run を押しても実行されない |
+
+`available: true` は「状態オブジェクトが在る」ではなく「**GCS に到達できた**」の意味。
+オブジェクト未作成 (NotFound) は `empty_state()` + `available: true` として現れるので、
+`runs_today: 0` / `day: ""` は「まだ 1 度も耐久ガードを通っていない」とも読める。
 
 ## 停止スイッチを解除する
 
@@ -47,11 +55,17 @@ curl.exe -s "https://sida-agent-860561433627.asia-northeast1.run.app/guard?key=$
 ### 手順 A: エンドポイント経由 (推奨・壇上向け)
 
 ```bash
-curl.exe -s -X POST "https://sida-agent-860561433627.asia-northeast1.run.app/guard/killswitch?key=$KEY" -H "Content-Type: application/json" -d "{\"tripped\":false}"
+curl.exe -s -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d "{\"tripped\":false}" "https://sida-agent-860561433627.asia-northeast1.run.app/guard/killswitch"
 ```
 
 応答の `"ok": true` を確認する。`"ok": false` は「そもそもストアが未設定」を意味するので、
 解除できたと読んではいけない。
+
+この POST は `reserve_run()` と同じ `_read` → CAS `_write` を通るので、**書き込み権限の
+確認にも使える**。Run を 1 回回す ($0.02 + 修正 PR が生成される) 必要はない。
+runtime SA に `storage.objects.create` が無いと `reserve_run()` は
+`(True, "unavailable")` を返して**黙って素通り**し、日次上限が永久に積み上がらないので、
+権限が生きていることは一度は確認しておく (2026-07-30 に確認済)。
 
 ### 手順 B: GCS 直接編集 (フォールバック)
 
