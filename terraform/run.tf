@@ -134,6 +134,17 @@ resource "google_cloud_run_v2_service" "agent" {
         value = var.enable_run_guard ? var.daily_run_limit : ""
       }
       env {
+        # Earned autonomy (default-off; see docs/earned-autonomy.md). Off is
+        # the live default between demos - the hourly rearm and autonomous
+        # recovery would otherwise loop. The finals checklist flips it.
+        name  = "AUTOSRE_AUTONOMY_ENABLED"
+        value = var.enable_autonomy ? "1" : ""
+      }
+      env {
+        name  = "AUTOSRE_AUTONOMY_THRESHOLD"
+        value = var.enable_autonomy ? var.autonomy_threshold : ""
+      }
+      env {
         # Video-attached user reports (default-off staged enablement, same
         # contract as the other AUTOSRE_* flags). The live demo runs with this
         # on via tfvars; reconciled here so an apply cannot strip the video

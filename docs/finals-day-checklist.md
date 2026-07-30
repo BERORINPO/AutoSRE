@@ -31,6 +31,25 @@
 - [ ] ブラウザのタブは**コンソール 1 枚だけ** (SSE は複数タブで inCident表示が競合しうる)
 - [ ] 画面共有の解像度でタイムラインとコストの 1 行が読めるか目視
 
+## Earned Autonomy の ON/OFF (自律復旧をデモする場合のみ)
+
+普段は **OFF が正** — ON のまま放置すると毎時の rearm と自律復旧が追いかけ合い、
+merge PR が 1 日 ~24 本量産される。
+
+- [ ] 登壇前に ON:
+
+  ```
+  gcloud run services update sida-agent --update-env-vars AUTOSRE_AUTONOMY_ENABLED=1 --project bero-devops-agent --region asia-northeast1
+  ```
+
+- [ ] `GET /trust` で対象クラスが `promoted: true` かつ `demoted: false` を確認
+      (コンソール上の「承認ゲートの信頼台帳」カードでも可)
+- [ ] **発表終了後に必ず OFF**:
+
+  ```
+  gcloud run services update sida-agent --remove-env-vars AUTOSRE_AUTONOMY_ENABLED --project bero-devops-agent --region asia-northeast1
+  ```
+
 ## 登壇直前 60 秒
 
 - [ ] `/target-health` 503 を最終確認

@@ -135,6 +135,30 @@ variable "daily_run_limit" {
   default     = "50"
 }
 
+variable "enable_autonomy" {
+  description = <<-EOT
+    Staged enablement for earned autonomy (docs/earned-autonomy.md): promoted
+    remediation classes recover WITHOUT a human approval click, after proving
+    the fix on a zero-traffic rehearsal revision. Default-off like the other
+    AUTOSRE_* flags, and deliberately kept off between demos on the live
+    project: the hourly demo-rearm job + autonomous recovery would otherwise
+    chase each other into ~24 merged PRs/day. Flip on for the stage, off after.
+    The trust ledger (GET /trust) stays readable either way.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "autonomy_threshold" {
+  description = <<-EOT
+    AUTOSRE_AUTONOMY_THRESHOLD: Wilson lower bound of verified successes a
+    class needs before it is promoted to autonomous execution. Empty uses the
+    application default (0.80). String because it is an env var.
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "enable_report_video" {
   description = <<-EOT
     Staged enablement for video-attached user reports (Gemini reads the screen
