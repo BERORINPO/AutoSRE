@@ -146,6 +146,52 @@ def memory_stats() -> dict:
         return {"enabled": True, "ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def resolution_stats_by_env_var() -> list[dict]:
+    """Verified track record per remediation class, for the trust ledger.
+
+    Joins each diagnosis (which env var was restored) to its resolution row
+    (did the human-approved fix actually recover the service) by pr_number.
+    Only diagnoses that reached a recorded resolution count as attempts:
+    an unapproved PR is not evidence in either direction.
+
+    Raises on failure — the caller (agents.autonomy.ledger) owns the policy of
+    treating an unreadable ledger as "nothing is promoted".
+    """
+    if not enabled():
+        return []
+    from google.cloud import bigquery  # lazy import
+
+    client = bigquery.Client(project=os.environ.get("GOOGLE_CLOUD_PROJECT") or None)
+    # One row per PR on each side before joining: replayed demos may record a
+    # diagnosis twice, and a duplicated join row would double-count evidence.
+    query = f"""
+        WITH diag AS (
+          SELECT pr_number, ANY_VALUE(missing_env_var) AS env_var
+          FROM `{_cases_table()}`
+          WHERE kind = 'diagnosis' AND pr_number IS NOT NULL
+            AND missing_env_var IS NOT NULL
+          GROUP BY pr_number
+        ),
+        res AS (
+          -- LOGICAL_AND: if any resolution attempt for a PR failed, the PR
+          -- counts as a failure. Trust arithmetic must be pessimistic.
+          SELECT pr_number, LOGICAL_AND(recovered) AS recovered
+          FROM `{_cases_table()}`
+          WHERE kind = 'resolution' AND pr_number IS NOT NULL
+          GROUP BY pr_number
+        )
+        SELECT diag.env_var, COUNTIF(res.recovered) AS successes, COUNT(*) AS attempts
+        FROM diag JOIN res ON res.pr_number = diag.pr_number
+        GROUP BY diag.env_var
+    """
+    rows = client.query(query).result(timeout=_BQ_TIMEOUT_S)
+    return [
+        {"env_var": r["env_var"], "successes": int(r["successes"] or 0),
+         "attempts": int(r["attempts"] or 0)}
+        for r in rows
+    ]
+
+
 def recall_similar_cases(service_name: str) -> dict:
     """Recall AutoSRE's own past incident cases for a service, newest first.
 
