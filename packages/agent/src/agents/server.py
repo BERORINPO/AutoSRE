@@ -250,12 +250,19 @@ async def incident(req: IncidentRequest, request: Request) -> dict:
     # to_thread: the sync BigQuery insert must not block the event loop
     # (a slow insert would freeze /events heartbeats on this single instance).
     await asyncio.to_thread(_record_case, diagnosis, "manual", req.service_name, started)
-    return {
+    # Earned autonomy (default-off): None leaves this response byte-identical.
+    autonomy_audit = await asyncio.to_thread(
+        _maybe_execute_autonomously, diagnosis, req.service_name, "manual"
+    )
+    response = {
         "steps": result["steps"],
         "outcome": _classify_outcome(diagnosis),
         "diagnosis": diagnosis,
         "raw_final": result["final"],
     }
+    if autonomy_audit is not None:
+        response["autonomy"] = autonomy_audit
+    return response
 
 
 def _check_console_key(request: Request) -> None:
@@ -382,6 +389,148 @@ def reset(request: Request) -> dict:
         "inject": inject_failure("sida-target", "DATABASE_URL"),
         "repo_reset": reset_repo_config(),
     }
+
+
+def _maybe_execute_autonomously(diagnosis: dict, service_name: str, source: str) -> dict | None:
+    """Earned autonomy: close the loop with NO human click, iff this class earned it.
+
+    Runs after a diagnosis produced a fix PR. Every step fails closed to the
+    existing human gate: feature off, class not promoted, allowlist miss,
+    rehearsal not green -> return with serving traffic untouched and the PR
+    waiting for a human exactly as today. The one path that acts is:
+    promoted class -> fix proven green on a zero-traffic rehearsal revision ->
+    merge + traffic promote -> verify on the real URL. A failed verify reverts
+    traffic to the pre-fix revision and DEMOTES the class on the spot
+    (one strike); the failure is also recorded into the same ledger the
+    promotion was earned from.
+
+    Returns None when autonomy is off/irrelevant (response stays byte-identical
+    to today), else an audit dict the console renders as the post-hoc record.
+    """
+    from agents import autonomy
+
+    if not autonomy.enabled():
+        return None
+    env_var = diagnosis.get("missing_env_var")
+    pr_number = diagnosis.get("pr_number")
+    if diagnosis.get("action") != "fix_pr" or not env_var or not pr_number:
+        return None
+    from agents.github_tools import allowed_env_vars
+
+    if env_var not in allowed_env_vars():
+        return None
+
+    demotions = state_store.read_demotions()
+    promoted, evidence = autonomy.promoted_for(env_var, demotions)
+    result: dict = {
+        "class": autonomy.class_key(env_var),
+        "promoted": promoted,
+        "evidence": evidence,
+        "attempted": False,
+    }
+    if not promoted:
+        result["outcome"] = "gate_kept"
+        return result
+
+    from urllib.parse import urlsplit
+
+    from agents.case_store import record_resolution
+    from agents.recovery import (
+        merge_pull_request,
+        promote_rehearsal,
+        rehearse_env_fix,
+        revert_traffic,
+        verify_recovery,
+    )
+
+    value = os.environ.get(f"AUTOSRE_RESTORE_{env_var}", "")
+    result["attempted"] = True
+    rehearsal = rehearse_env_fix(service_name, env_var, value)
+    result["rehearsal"] = rehearsal
+    if not rehearsal.get("ok"):
+        result["outcome"] = "rehearsal_error_gate_kept"
+        return result
+
+    health_url = os.environ.get("TARGET_HEALTH_URL", "")
+    health_path = urlsplit(health_url).path or "/health"
+    rehearsal_health = verify_recovery(
+        rehearsal["rehearsal_url"].rstrip("/") + health_path, timeout_s=90
+    )
+    result["rehearsal_health"] = rehearsal_health
+    if not rehearsal_health.get("recovered"):
+        # The fix did not prove itself next door -> nothing was risked, the
+        # serving revision never changed, and the PR waits for a human.
+        result["outcome"] = "rehearsal_red_gate_kept"
+        return result
+
+    started = time.time()
+    result["merge"] = merge_pull_request(int(pr_number))
+    promote = promote_rehearsal(service_name)
+    result["promote"] = promote
+    verify = verify_recovery(health_url)
+    result["verify"] = verify
+    recovered = bool(verify.get("recovered")) and bool(promote.get("ok"))
+    # Feed the SAME ledger the promotion was earned from - autonomous outcomes
+    # must count exactly like human-approved ones, or the statistics go blind
+    # right when the gate opens.
+    record_resolution(int(pr_number), recovered, time.time() - started)
+    if recovered:
+        result["outcome"] = "autonomous_recovery_verified"
+    else:
+        result["revert"] = revert_traffic(
+            service_name, rehearsal["snapshot"]["prev_revision"]
+        )
+        demoted = state_store.set_demotion(
+            result["class"], reason=f"autonomous verify failed (pr #{pr_number})"
+        )
+        result["demotion_recorded"] = demoted
+        result["outcome"] = "reverted_and_demoted"
+        print(
+            json.dumps(
+                {
+                    "severity": "ERROR" if demoted else "CRITICAL",
+                    "event": "autonomy_demoted",
+                    "class": result["class"],
+                    "pr_number": pr_number,
+                    "demotion_recorded": demoted,
+                    "source": source,
+                }
+            ),
+            flush=True,
+        )
+    _invalidate_console_meta()
+    return result
+
+
+@app.get("/trust")
+def trust_ledger(request: Request) -> dict:
+    """The trust ledger: per-class verified success record vs the promotion bar.
+
+    This endpoint IS the feature's honesty: it shows the gate's retirement
+    schedule before, during and after promotion, from the same BigQuery rows
+    the learning loop records - nothing here is asserted at pitch time. Key-
+    gated like /guard: which classes act without approval is operator data.
+    """
+    _check_console_key(request)
+    from agents import autonomy
+
+    return autonomy.ledger(state_store.read_demotions())
+
+
+class RearmRequest(BaseModel):
+    class_key: str
+
+
+@app.post("/trust/rearm")
+def trust_rearm(req: RearmRequest, request: Request) -> dict:
+    """Human re-arm of a demoted class. Deliberately the ONLY road back:
+    statistics can open the gate the first time, but after a strike the ledger
+    alone can never reopen it - a person has to look at what went wrong."""
+    _check_console_key(request)
+    from agents import autonomy
+
+    ok = state_store.clear_demotion(req.class_key)
+    return {"ok": ok, "ledger": autonomy.ledger(state_store.read_demotions())}
 
 
 class KillswitchRequest(BaseModel):
@@ -796,10 +945,21 @@ async def pubsub_incident(request: Request) -> dict:
         _broadcast({"type": "error", "error": str(e)})
         _broadcast({"type": "done"})
         return {"status": "error", "error": str(e)[:300]}
+    # The 2am path: this handler had no human in it before the approval gate,
+    # and with a promoted class it now has none after it either. Broadcast the
+    # audit so any open console renders the post-hoc record live.
+    autonomy_audit = await asyncio.to_thread(
+        _maybe_execute_autonomously, diagnosis, "sida-target", "pubsub"
+    )
+    if autonomy_audit is not None:
+        _broadcast({"type": "autonomy", "audit": autonomy_audit})
     _broadcast({"type": "done"})
 
-    return {
+    response = {
         "status": "handled",
         "outcome": _classify_outcome(diagnosis),
         "diagnosis": diagnosis,
     }
+    if autonomy_audit is not None:
+        response["autonomy"] = autonomy_audit
+    return response
