@@ -32,6 +32,11 @@ from pydantic import BaseModel
 # state_store pulls only stdlib at import time — the storage client is lazy
 # inside it — and it gates every run-starting route, so it is on the hot path.
 from agents import state_store
+# Pure functions over the model's final answer; kept in their own stdlib-only
+# module so the offline gate can drive them without FastAPI/ADK installed.
+from agents.diagnosis import classify_outcome as _classify_outcome
+from agents.diagnosis import parse_diagnosis as _parse_diagnosis
+from agents.diagnosis import salvage_diagnosis as _salvage_diagnosis
 
 _UI_HTML = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
 
@@ -116,34 +121,6 @@ def smoke() -> JSONResponse:
         status_code=200 if overall_ok else 500,
         content={"overall_ok": overall_ok, "gemini": gemini, "logging": logging_result},
     )
-
-
-def _parse_diagnosis(text: str) -> dict:
-    """Tolerantly extract the agent's final JSON diagnosis (models sometimes wrap it in code fences)."""
-    if not text:
-        return {"error": "empty_final"}
-    t = text.strip()
-    if t.startswith("```"):
-        t = re.sub(r"^```(?:json)?", "", t).strip()
-        t = re.sub(r"```$", "", t).strip()
-    start, end = t.find("{"), t.rfind("}")
-    if start != -1 and end > start:
-        t = t[start : end + 1]
-    try:
-        return json.loads(t)
-    except Exception as e:  # noqa: BLE001
-        return {"error": f"parse_failed: {e}", "raw": text[:500]}
-
-
-def _classify_outcome(d: dict) -> str:
-    """Classify the agent's diagnosis into a single outcome label (frozen cross-worker contract)."""
-    if d.get("pr_url"):
-        return "pr_opened"
-    if d.get("action") == "escalate" or d.get("escalation"):
-        return "escalated"
-    if d.get("missing_env_var") is None:
-        return "healthy"
-    return "none"
 
 
 def _record_case(diagnosis: dict, source: str, service: str, started_ts: float) -> None:
@@ -246,7 +223,7 @@ async def incident(req: IncidentRequest, request: Request) -> dict:
             "raw_final": "",
             "error": str(e),
         }
-    diagnosis = _parse_diagnosis(result["final"])
+    diagnosis = _salvage_diagnosis(_parse_diagnosis(result["final"]), result.get("steps"))
     # to_thread: the sync BigQuery insert must not block the event loop
     # (a slow insert would freeze /events heartbeats on this single instance).
     await asyncio.to_thread(_record_case, diagnosis, "manual", req.service_name, started)
@@ -348,10 +325,15 @@ async def incident_stream(request: Request) -> StreamingResponse:
             yield 'data: {"type": "done"}\n\n'
             return
         diagnosis: dict = {}
+        # Kept so _salvage_diagnosis can consult what the tools actually did if
+        # the model's final JSON does not parse.
+        trace: list[dict] = []
         try:
             async for ev in run_incident_events(incident_text):
+                if ev.get("type") == "tool_result":
+                    trace.append({"name": ev.get("name"), "summary": ev.get("summary")})
                 if ev.get("type") == "final":
-                    diagnosis = _parse_diagnosis(ev["final"])
+                    diagnosis = _salvage_diagnosis(_parse_diagnosis(ev["final"]), trace)
                     run_cost = ev.get("cost")
                     await asyncio.to_thread(
                         _record_case, diagnosis, "console", "sida-target", started
@@ -984,12 +966,15 @@ async def pubsub_incident(request: Request) -> dict:
     # Stream the autonomous run to every open console (in-process broadcast), then
     # still return the same ack dict shape so the Pub/Sub push ack is unaffected.
     diagnosis: dict = {}
+    trace: list[dict] = []  # tool ground truth for _salvage_diagnosis
     started = time.time()
     _broadcast({"type": "run_started", "source": "pubsub"})
     try:
         async for ev in run_incident_events(incident_text):
+            if ev.get("type") == "tool_result":
+                trace.append({"name": ev.get("name"), "summary": ev.get("summary")})
             if ev.get("type") == "final":
-                diagnosis = _parse_diagnosis(ev["final"])
+                diagnosis = _salvage_diagnosis(_parse_diagnosis(ev["final"]), trace)
                 run_cost = ev.get("cost")
                 await asyncio.to_thread(
                     _record_case, diagnosis, "pubsub", "sida-target", started

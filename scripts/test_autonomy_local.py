@@ -130,6 +130,63 @@ def test_rehearsal_precedes_action() -> None:
     assert names.index("rehearse_env_fix") < names.index("promote_rehearsal")
 
 
+
+def test_parse_failure_is_not_healthy() -> None:
+    """The exact malformed final seen in production 2026-07-30: the model put a
+    key/value pair inside the "evidence" ARRAY. Before the fix this parsed to
+    {} and classified as "healthy" - a green console over a down service."""
+    from agents.diagnosis import classify_outcome as _classify_outcome
+    from agents.diagnosis import parse_diagnosis as _parse_diagnosis
+    from agents.diagnosis import salvage_diagnosis as _salvage_diagnosis
+
+    broken = '''```json
+{
+  "root_cause": "Required environment variable DATABASE_URL is not set, causing 503.",
+  "evidence": [
+    "body": "{\\"status\\":\\"unhealthy\\"}",
+    "startup check failed"
+  ],
+  "missing_env_var": "DATABASE_URL",
+  "confidence": 1.0,
+  "user_reply_draft": "\u5fa9\u65e7\u3057\u307e\u3057\u305f",
+  "action": "fix_pr"
+}
+```'''
+    parsed = _parse_diagnosis(broken)
+    assert parsed.get("error"), "this payload must genuinely fail json.loads"
+    assert _classify_outcome(parsed) == "undetermined", "a parse failure must never read as healthy"
+
+    steps = [{"name": "open_pull_request",
+              "summary": {"ok": True, "pr_number": 59,
+                          "pr_url": "https://github.com/o/r/pull/59"}}]
+    fixed = _salvage_diagnosis(parsed, steps)
+    assert fixed["pr_number"] == 59 and fixed["action"] == "fix_pr"
+    assert fixed["missing_env_var"] == "DATABASE_URL"
+    assert fixed["root_cause"].startswith("Required environment variable")
+    assert fixed["confidence"] == 1.0
+    assert fixed["user_reply_draft"] == "復旧しました"
+    assert fixed["parse_recovered"] is True
+    assert _classify_outcome(fixed) == "pr_opened", "a real PR must surface the approval gate"
+
+
+def test_salvage_leaves_good_parses_alone() -> None:
+    """Salvage is a repair path, not a rewrite: a clean parse passes through
+    untouched, and no PR in the trace must not conjure one."""
+    from agents.diagnosis import classify_outcome as _classify_outcome
+    from agents.diagnosis import salvage_diagnosis as _salvage_diagnosis
+
+    good = {"missing_env_var": "DATABASE_URL", "action": "fix_pr", "pr_url": "u", "pr_number": 1}
+    assert _salvage_diagnosis(good, [{"name": "open_pull_request",
+                                      "summary": {"ok": True, "pr_number": 99}}]) is good
+
+    healthy = {"missing_env_var": None, "action": "none"}
+    assert _classify_outcome(healthy) == "healthy", "a real healthy verdict still reads healthy"
+
+    no_pr = _salvage_diagnosis({"error": "parse_failed: x", "raw": "{}"}, [])
+    assert "pr_url" not in no_pr and no_pr["parse_recovered"] is False
+    assert _classify_outcome(no_pr) == "undetermined"
+
+
 def main() -> int:
     tests = [
         test_wilson_lower_bound,
@@ -138,6 +195,8 @@ def main() -> int:
         test_fail_closed,
         test_demotions_survive_state_merge,
         test_rehearsal_precedes_action,
+        test_parse_failure_is_not_healthy,
+        test_salvage_leaves_good_parses_alone,
     ]
     failures = 0
     for t in tests:
