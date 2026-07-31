@@ -3,6 +3,19 @@
 指差しで上から順に。**発表 5 分・当日ライブデモあり**の前提。
 `$URL` = `https://sida-agent-860561433627.asia-northeast1.run.app`、`$KEY` = コンソールキー。
 
+## まず 1 コマンド (以下の確認をまとめて出す)
+
+```
+.\scripts\demo.ps1 status
+```
+
+対象サービスの状態・本日の実行回数・停止スイッチ・自律 ON/OFF・信頼台帳を一画面で表示する。
+デスクトップの **「AutoSRE 状態確認.cmd」** をダブルクリックでも同じ。
+壇上ではこれを見て、下の個別項目は異常時だけ辿る。
+
+- デモ開始 (障害を起こしてコンソールを開く): `.\scripts\demo.ps1` / 「AutoSRE デモ開始.cmd」
+- コンソールだけ開く: `.\scripts\demo.ps1 open`
+
 ## 朝イチ (自宅 or 移動前)
 
 - [ ] ガードの武装確認 — `enabled: true` / `available: true` であること:
@@ -39,7 +52,7 @@ merge PR が 1 日 ~24 本量産される。
 - [ ] 登壇前に ON:
 
   ```
-  gcloud run services update sida-agent --update-env-vars AUTOSRE_AUTONOMY_ENABLED=1 --project bero-devops-agent --region asia-northeast1
+  .\scripts\demo.ps1 autonomy-on
   ```
 
 - [ ] `GET /trust` で対象クラスが `promoted: true` かつ `demoted: false` を確認
@@ -47,7 +60,7 @@ merge PR が 1 日 ~24 本量産される。
 - [ ] **発表終了後に必ず OFF**:
 
   ```
-  gcloud run services update sida-agent --remove-env-vars AUTOSRE_AUTONOMY_ENABLED --project bero-devops-agent --region asia-northeast1
+  .\scripts\demo.ps1 autonomy-off
   ```
 
 ## 登壇直前 60 秒
