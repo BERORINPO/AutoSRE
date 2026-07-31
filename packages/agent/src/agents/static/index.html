@@ -466,7 +466,8 @@ function handleAgentEvent(ev){
   }else if(ev.type==="final"){
     document.getElementById("runningText").textContent = "診断を確定しています…";
     const d = ev.diagnosis||{}; renderDiagnosis(d);
-    try{ renderConclusion(d, ev.outcome); }catch(e){ console.warn("conclusion render failed", e); }
+    try{ attachEvidenceToSteps(d); renderConclusion(d, ev.outcome); }
+    catch(e){ console.warn("conclusion render failed", e); }
     currentReplyDraft = d.user_reply_draft || null;
     if(ev.outcome==="escalated" || d.action==="escalate" || d.escalation){
       renderEscalation(d);
@@ -756,6 +757,37 @@ function renderVideo(v){
   body.innerHTML = html;
 }
 
+// evidence[] から「決め手の行」「ログ由来の行」「設定由来の行」を選り分ける。
+// 録画由来の行 (Video analysis: …) は長く引用符まみれで決め手には向かないので後回し。
+// evidence は final イベントで既に届いているデータ — 新たな取得も露出もしない。
+function evidenceLines(d){
+  const all = (Array.isArray(d.evidence) ? d.evidence : []).map(x => String(x));
+  const v = d.missing_env_var ? String(d.missing_env_var) : "";
+  const mentions = l => !!v && l.indexOf(v) >= 0;
+  const nonVideo = all.filter(l => !/^\s*Video analysis/i.test(l));
+  const config = nonVideo.find(l => /configured|is missing|環境変数/i.test(l) && mentions(l)) || null;
+  const log = nonVideo.find(l => l !== config && mentions(l)) || null;
+  const best = log || config || nonVideo.find(mentions) || all.find(mentions) || null;
+  return {best, log, config};
+}
+
+// 決め手になった実データを、それを見つけたステップの下に戻す。ここが無いと
+// 「20 行を取得」「環境変数 1 件を精査」で終わり、推理の鎖が画面から消える。
+function attachEvidenceToSteps(d){
+  const {log, config} = evidenceLines(d);
+  const put = (tool, line) => {
+    if(!line) return;
+    const li = [...document.querySelectorAll("#timeline li.step")].find(x => x.dataset.tool === tool);
+    if(!li || li.querySelector(".evline")) return;
+    const el = document.createElement("div");
+    el.className = "snip evline";
+    el.textContent = line.length > 150 ? line.slice(0,150)+"…" : line;
+    li.children[1].appendChild(el);
+  };
+  put("get_recent_logs", log);
+  put("get_service_config", config);
+}
+
 // 「何が起きたか」を 1 文で言う。タイムラインは *何をしたか* を並べるが、
 // 視聴者が知りたいのは *何が分かったか* と *次に何が起きるか*。ここが無いと
 // 「数を数えていたら急に PR が出てきた」ようにしか見えない。
@@ -765,9 +797,7 @@ function renderConclusion(d, outcome){
   const body = document.getElementById("conclusionBody");
   const v = d.missing_env_var ? "<code>"+escapeHtml(String(d.missing_env_var))+"</code>" : "";
   const reports = (lastUserReportCount != null) ? lastUserReportCount + " 件" : "";
-  // evidence[] は根拠カードにも出るが、決定打の 1 行はここに引き上げる。
-  const hit = (Array.isArray(d.evidence) ? d.evidence : [])
-    .find(e => d.missing_env_var && String(e).includes(String(d.missing_env_var)));
+  const hit = evidenceLines(d).best;
   let html = "";
 
   if(outcome === "pr_opened"){
