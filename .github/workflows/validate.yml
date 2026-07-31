@@ -101,3 +101,4 @@ jobs:
           python scripts/test_state_store_local.py
           python scripts/test_env_patch_local.py
           python scripts/test_cost_accounting_local.py
+          python scripts/test_autonomy_local.py

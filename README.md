@@ -172,6 +172,17 @@ See [docs/sprint-4day-autosre.md](docs/sprint-4day-autosre.md) for the full, rep
 `gcloud run deploy` commands and the Cloud Run gotchas we hit (reserved `/healthz`,
 PowerShell env-var quoting, Vertex `global` location).
 
+## Cost guard
+
+The agent holds a durable run budget (cooldown, daily limit, kill switch) in a single
+GCS object, so the ceiling survives cold starts and `maxScale > 1`. It is default-off,
+and a disabled guard still answers "run allowed" — so it has to be *read*, not inferred
+from runs succeeding. `GET /guard` reports whether it is armed; the daily-limit self-trip
+stays tripped until a human clears it.
+
+See [docs/cost-guard-runbook.md](docs/cost-guard-runbook.md) for the pre-demo check and
+how to clear a tripped kill switch.
+
 ## Roadmap (designed for, deliberately out of hackathon scope)
 
 These were scoped out to ship one deep, reliable vertical slice in the hackathon window,

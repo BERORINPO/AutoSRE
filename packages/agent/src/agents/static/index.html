@@ -130,10 +130,22 @@
     </div>
   </div>
 
+  <div class="card hidden" id="trustCard" style="margin-bottom:16px">
+    <h2>承認ゲートの信頼台帳 — Earned Autonomy</h2>
+    <div id="trustBody" class="muted">読み込み中…</div>
+    <div class="hint">検証済み成功の Wilson 下限が 0.80 を超えたクラスだけ、承認なしの自律復旧を許可します。
+      統計はゲートを開けられますが、一度の失敗で即降格 — 再開放できるのは人間だけです。</div>
+  </div>
+
   <div class="card" id="userReportsCard" style="margin-bottom:16px">
     <h2>ユーザからの声 <span class="muted" id="urCount"></span></h2>
     <div id="userReports" class="muted">読み込み中…</div>
     <div id="urAttachment" class="hint hidden">報告にはユーザの画面録画が添付されています — Run 時に Gemini が視聴し、症状と再現手順を抽出します。</div>
+  </div>
+
+  <div class="card hidden" id="conclusionCard" style="margin-bottom:16px;border-color:rgba(74,222,128,.45)">
+    <h2>このランで何が起きたか</h2>
+    <div id="conclusionBody" style="font-size:14.5px;line-height:1.7"></div>
   </div>
 
   <div class="grid">
@@ -218,6 +230,7 @@
 
 <script>
 let currentPr = null;
+let lastUserReportCount = null;
 let currentReplyDraft = null;
 let consoleMeta = {memory:{}, video:{}};
 
@@ -246,6 +259,46 @@ function setExpNum(id, v, tick){
   const el = document.getElementById(id);
   el.textContent = (typeof v==="number") ? String(v) : "–";
   if(tick){ el.classList.remove("tickup"); void el.offsetWidth; el.classList.add("tickup"); }
+}
+
+// 信頼台帳カード: /trust (key ゲート付き) を描画。key 無し / 未対応サーバ /
+// 台帳が読めない場合はカードを出さない = 従来コンソールと同一表示。
+async function loadTrust(){
+  if(!CONSOLE_KEY) return;
+  try{
+    const r = await fetch("/trust", {headers: authHeaders()});
+    if(!r.ok) return;
+    const j = await r.json();
+    if(!j.available || !(j.classes||[]).length) return;
+    const card = document.getElementById("trustCard");
+    document.getElementById("trustBody").innerHTML = j.classes.map(c=>{
+      const lb = Number(c.wilson_lower_bound||0), thr = Number(c.threshold||0.8);
+      const pct = Math.round(Math.min(1, lb) * 100);
+      const bar = Math.round(Math.min(1, lb/Math.max(thr,0.01)) * 100);
+      // j.enabled = 自律実行そのものの ON/OFF。これを見ずに promoted だけで
+      // 「承認なしで復旧可」と出すと、OFF のまま承認ボタンが出て矛盾する。
+      const badge = c.demoted
+        ? "<span style='color:var(--warn);font-weight:600'>降格中 — 人間の再武装待ち</span>"
+        : c.promoted
+          ? (j.enabled
+              ? "<span style='color:var(--good);font-weight:600'>開放 — 承認なしで復旧します</span>"
+              : "<span style='color:var(--good);font-weight:600'>開放ライン到達</span>"
+                + "<span class='muted' style='margin-left:6px'>(自律実行は今 OFF — 承認ゲートあり)</span>")
+          : "<span class='muted'>ゲート内 — 実績を蓄積中</span>";
+      return "<div style='border:1px solid var(--line);border-radius:6px;padding:10px;margin-bottom:8px'>"+
+        "<div class='row' style='justify-content:space-between;flex-wrap:wrap;gap:6px'>"+
+          "<span><code>"+escapeHtml(String(c.env_var||c.class))+"</code> の復元 · "+
+            "検証済み <b>"+escapeHtml(String(c.successes))+"/"+escapeHtml(String(c.attempts))+"</b></span>"+
+          badge+"</div>"+
+        "<div style='margin-top:8px;background:var(--panel2);border:1px solid var(--line);border-radius:4px;height:10px;position:relative;overflow:hidden'>"+
+          "<div style='width:"+bar+"%;height:100%;background:"+(c.promoted?"var(--good)":"rgba(200,212,235,.45)")+"'></div>"+
+        "</div>"+
+        "<div class='muted' style='font-size:11.5px;margin-top:4px;font-family:var(--mono)'>"+
+          "Wilson 下限 "+lb.toFixed(3)+" / 開放ライン "+thr.toFixed(2)+" ("+pct+"%)</div>"+
+        "</div>";
+    }).join("");
+    card.classList.remove("hidden");
+  }catch(e){ /* 台帳が読めない = カード非表示のまま */ }
 }
 
 // URL の ?key= を一度だけ読む。未指定なら認証ヘッダを付けない（今日と完全に同一の挙動）。
@@ -286,9 +339,18 @@ function stepLi(s){
   const body = document.createElement("div");
   const label = LABELS[s.name]||s.name;
   // label は LABELS[] の定数 or ツール名。args の値は LLM/ツール由来なので必ずエスケープ。
+  // 引数はデバッグ情報であって物語ではない。service_name はデモが 1 サービスなので
+  // 毎行同じ、URL と gs:// パスは長いだけ — 読ませたい発見内容(snip)を押し出す。
+  const NOISY_ARGS = new Set(["service_name","url","target_health_url","video_ref","health_url"]);
+  const shownArgs = Object.entries(s.args||{})
+    .filter(([k])=>!NOISY_ARGS.has(k))
+    .map(([k,v])=>{
+      let val = String(v);
+      if(val.length > 60) val = val.slice(0,60)+"…";
+      return escapeHtml(k)+"="+escapeHtml(val);
+    });
   body.innerHTML = "<b>"+escapeHtml(String(label))+"</b>" +
-    (s.args && Object.keys(s.args).length ? "<div class='args'>"+
-      Object.entries(s.args).map(([k,v])=>escapeHtml(String(k))+"="+escapeHtml(String(v))).join("  ·  ")+"</div>":"");
+    (shownArgs.length ? "<div class='args'>"+shownArgs.join("  ·  ")+"</div>" : "");
   li.appendChild(ico); li.appendChild(body);
   return li;
 }
@@ -404,6 +466,8 @@ function handleAgentEvent(ev){
   }else if(ev.type==="final"){
     document.getElementById("runningText").textContent = "診断を確定しています…";
     const d = ev.diagnosis||{}; renderDiagnosis(d);
+    try{ attachEvidenceToSteps(d); renderConclusion(d, ev.outcome); }
+    catch(e){ console.warn("conclusion render failed", e); }
     currentReplyDraft = d.user_reply_draft || null;
     if(ev.outcome==="escalated" || d.action==="escalate" || d.escalation){
       renderEscalation(d);
@@ -412,6 +476,10 @@ function handleAgentEvent(ev){
     // 承認ゲートを出し切った後に描く。ここで例外が出ても登壇中の承認ボタンを
     // 巻き添えにしないよう、順序と try/catch の両方で守る。
     try{ renderRunCost(ev.cost); }catch(e){ console.warn("run cost render failed", e); }
+  }else if(ev.type==="autonomy_step"){
+    handleAutonomyStep(ev);
+  }else if(ev.type==="autonomy"){
+    handleAutonomyAudit(ev.audit||{});
   }else if(ev.type==="blocked"){
     // コストガードが自分で止めた。エラーではないので、そう見えるように描画する。
     stopRunClock();
@@ -444,6 +512,64 @@ function handleAgentEvent(ev){
   }
 }
 
+// ---- Earned Autonomy: 自律実行の実況 ----
+// 段階イベント (autonomy_step) をタイムラインに刻む。stage は server 側定数のみ
+// だが、url / 数値は実データ由来なのでエスケープを通す。
+const AUTONOMY_STAGES = {
+  engaged:            (s)=>"承認ゲート通過 — このクラスは実績で開放済み ("+
+                          escapeHtml(String(s.successes??"–"))+"/"+escapeHtml(String(s.attempts??"–"))+
+                          "、Wilson 下限 "+escapeHtml(String(s.wilson_lower_bound??"–"))+")",
+  rehearsal_started:  ()=>"リハーサル: 修正をトラフィック 0% の revision として展開中…",
+  rehearsal_deployed: ()=>"リハーサル revision 準備完了 — tag URL でヘルス検査中…",
+  rehearsal_green:    ()=>"リハーサル 200 — 修正は本番の隣で証明されました",
+  merged:             (s)=>"PR #"+escapeHtml(String(s.pr_number??""))+" を自動マージ",
+  promoted:           ()=>"トラフィック昇格 — 証明済み revision が本番へ",
+  verified:           ()=>"本番 URL で復旧確認 (200) — ここまで人間のクリック 0",
+  gate_kept:          (s)=>"自律実行を中断 ("+escapeHtml(String(s.reason||""))+") — 人間の承認ゲートに戻します",
+  reverted_demoted:   ()=>"検証失敗 — トラフィックを即時巻き戻し、クラスを降格しました"
+};
+let autonomyLiRunning = null;
+function handleAutonomyStep(ev){
+  const fn = AUTONOMY_STAGES[ev.stage];
+  if(!fn) return;
+  if(ev.stage==="engaged"){
+    // 承認ボタンは出さない — このランはゲートを実績で通過している。
+    document.getElementById("approveWrap").classList.add("hidden");
+    document.getElementById("running").classList.remove("hidden");
+  }
+  document.getElementById("runningText").textContent = "自律復旧を実行中…";
+  const tl = document.getElementById("timeline");
+  if(autonomyLiRunning){ autonomyLiRunning.classList.remove("running"); autonomyLiRunning.classList.add("done"); }
+  const li = document.createElement("li"); li.className="step running";
+  const ico = document.createElement("div"); ico.className="ico pr"; ico.textContent="AUTO";
+  const body = document.createElement("div"); body.innerHTML = "<b>"+fn(ev)+"</b>";
+  li.appendChild(ico); li.appendChild(body); tl.appendChild(li);
+  autonomyLiRunning = li;
+  const bad = (ev.stage==="gate_kept" || ev.stage==="reverted_demoted");
+  if(bad){ li.classList.remove("running"); li.classList.add("done"); autonomyLiRunning = null; }
+}
+// 最終監査 (autonomy) — 成功なら復旧/報告カードまで自動で埋める。
+function handleAutonomyAudit(a){
+  if(autonomyLiRunning){ autonomyLiRunning.classList.remove("running"); autonomyLiRunning.classList.add("done"); autonomyLiRunning=null; }
+  loadTrust(); refreshTarget(); loadConsoleMeta(true);
+  if(a.outcome==="autonomous_recovery_verified"){
+    document.getElementById("approveWrap").classList.add("hidden");
+    const rc=document.getElementById("recoverCard"); rc.classList.remove("hidden");
+    document.getElementById("recoverBody").innerHTML =
+      kv("マージ", (a.merge&&a.merge.merged)?"完了 (自動)":"—") +
+      kv("リハーサル", (a.rehearsal_health&&a.rehearsal_health.recovered)?"200 (トラフィック 0% で事前証明)":"—") +
+      kv("復旧確認", (a.verify&&a.verify.recovered)?"200 · 復旧":"—") +
+      "<div class='hint'>この復旧に人間の承認クリックはありません — このクラスは検証済み実績でゲートを通過しています。結果は同じ台帳に記録され、失敗していれば即降格でした。</div>";
+    const fc=document.getElementById("finaleCard"); fc.classList.remove("hidden"); fc.classList.add("flash");
+    document.getElementById("finaleBody").innerHTML =
+      (currentReplyDraft? "<div style='background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:13.5px'>"+escapeHtml(currentReplyDraft)+"</div>" : "")+
+      "<div class='hint'>検知 → 診断 → 修正 → 証明 → 復旧 → 報告。すべて自律、すべて検証付き。</div>";
+  }else if(a.outcome && a.outcome.indexOf("gate_kept")>=0 && currentPr){
+    // fail-closed: PR は残っているので、従来どおり人間の承認に切り替える。
+    document.getElementById("approveWrap").classList.remove("hidden");
+  }
+}
+
 // タイムライン UI を「実行中」状態にリセットする共通処理。
 // 手動実行・自動検知の両方で使う（開始文言だけ引数で差し替え）。
 // 手動 runIncident と完全同一の DOM 操作のみ（今日と同じ挙動）。
@@ -454,6 +580,8 @@ function resetTimelineForRun(runningText){
   document.getElementById("runningText").textContent=runningText;
   // 前回がコストガードで止まっていた場合の残留状態を戻す。
   blockedNotice = false;
+  autonomyLiRunning = null;
+  document.getElementById("conclusionCard").classList.add("hidden");
   const sp = document.querySelector("#running .spinner");
   if(sp) sp.style.visibility = "";
   startRunClock();
@@ -629,6 +757,74 @@ function renderVideo(v){
   body.innerHTML = html;
 }
 
+// evidence[] から「決め手の行」「ログ由来の行」「設定由来の行」を選り分ける。
+// 録画由来の行 (Video analysis: …) は長く引用符まみれで決め手には向かないので後回し。
+// evidence は final イベントで既に届いているデータ — 新たな取得も露出もしない。
+function evidenceLines(d){
+  const all = (Array.isArray(d.evidence) ? d.evidence : []).map(x => String(x));
+  const v = d.missing_env_var ? String(d.missing_env_var) : "";
+  const mentions = l => !!v && l.indexOf(v) >= 0;
+  const nonVideo = all.filter(l => !/^\s*Video analysis/i.test(l));
+  const config = nonVideo.find(l => /configured|is missing|環境変数/i.test(l) && mentions(l)) || null;
+  const log = nonVideo.find(l => l !== config && mentions(l)) || null;
+  const best = log || config || nonVideo.find(mentions) || all.find(mentions) || null;
+  return {best, log, config};
+}
+
+// 決め手になった実データを、それを見つけたステップの下に戻す。ここが無いと
+// 「20 行を取得」「環境変数 1 件を精査」で終わり、推理の鎖が画面から消える。
+function attachEvidenceToSteps(d){
+  const {log, config} = evidenceLines(d);
+  const put = (tool, line) => {
+    if(!line) return;
+    const li = [...document.querySelectorAll("#timeline li.step")].find(x => x.dataset.tool === tool);
+    if(!li || li.querySelector(".evline")) return;
+    const el = document.createElement("div");
+    el.className = "snip evline";
+    el.textContent = line.length > 150 ? line.slice(0,150)+"…" : line;
+    li.children[1].appendChild(el);
+  };
+  put("get_recent_logs", log);
+  put("get_service_config", config);
+}
+
+// 「何が起きたか」を 1 文で言う。タイムラインは *何をしたか* を並べるが、
+// 視聴者が知りたいのは *何が分かったか* と *次に何が起きるか*。ここが無いと
+// 「数を数えていたら急に PR が出てきた」ようにしか見えない。
+// 使うのは既に画面に届いているデータだけ (新しい取得はしない)。
+function renderConclusion(d, outcome){
+  const card = document.getElementById("conclusionCard");
+  const body = document.getElementById("conclusionBody");
+  const v = d.missing_env_var ? "<code>"+escapeHtml(String(d.missing_env_var))+"</code>" : "";
+  const reports = (lastUserReportCount != null) ? lastUserReportCount + " 件" : "";
+  const hit = evidenceLines(d).best;
+  let html = "";
+
+  if(outcome === "pr_opened"){
+    html =
+      "<div>" + (reports ? "ユーザからの報告 <b>"+reports+"</b> を起点に、" : "") +
+      "エージェントが<b>実ログと実デプロイ設定</b>を読み、原因を " + (v||"—") + " の欠落と特定しました。" +
+      "修正 PR " + (d.pr_number ? "<b>#"+escapeHtml(String(d.pr_number))+"</b>" : "") + " を起票済みです。</div>" +
+      (hit ? "<div class='hint' style='margin-top:8px'>決め手になった実データ: <code>"+escapeHtml(String(hit).slice(0,180))+"</code></div>" : "") +
+      "<div style='margin-top:10px'><b>次にすること:</b> 右の「<span style='color:var(--good)'>承認して修正を反映</span>」を押すと、" +
+      "PR をマージ → 設定を適用 → <b>復旧したかどうかまでエージェントが確認</b>します。</div>";
+  }else if(outcome === "escalated"){
+    html = "<div>エージェントは<b>自動修正の権限外</b>と判断し、PR を起票せずに停止しました。" +
+           "下の「人間へのエスカレーション」に対応手順が出ています。</div>" +
+           "<div class='hint' style='margin-top:8px'>直せる範囲を許可リストで縛ってあるため、範囲外は必ず人間に上げます。</div>";
+  }else if(outcome === "healthy"){
+    html = "<div>調査の結果、<b>サービスは正常</b>でした。修正は行いません。</div>" +
+           "<div class='hint' style='margin-top:8px'>報告があっても実データが正常なら「異常なし」と言い切ります。</div>";
+  }else if(outcome === "undetermined"){
+    html = "<div><b>診断結果を読み取れませんでした</b>（モデルの出力形式が壊れています）。" +
+           "実行したツールの記録は残っているので、PR が作られていれば承認ボタンが出ます。</div>";
+  }else{
+    html = "<div>調査は完了しましたが、修正 PR は起票されませんでした。</div>";
+  }
+  body.innerHTML = html;
+  card.classList.remove("hidden");
+}
+
 function renderDiagnosis(d){
   const card=document.getElementById("diagCard"); card.classList.remove("hidden");
   const conf = typeof d.confidence==="number" ? Math.round(d.confidence*100)+"%" : "—";
@@ -799,6 +995,7 @@ async function loadUserReports(){
       box.textContent = "現在、ユーザからの報告はありません。";
       document.getElementById("urCount").textContent=""; return;
     }
+    lastUserReportCount = j.count;
     document.getElementById("urCount").textContent = "（"+j.count+" 件の報告）";
     box.innerHTML = j.reviews.map(v=>
       "<div style='padding:8px 0 8px 10px;border-bottom:1px solid var(--line);border-left:2px solid var(--bad)'>"+
@@ -809,6 +1006,7 @@ async function loadUserReports(){
 
 loadUserReports();
 loadConsoleMeta();
+loadTrust();
 refreshTarget();
 setInterval(refreshTarget, 15000);
 

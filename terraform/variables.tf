@@ -110,3 +110,84 @@ variable "model_armor_template" {
   type        = string
   default     = ""
 }
+
+variable "enable_run_guard" {
+  description = <<-EOT
+    Durable run guard (cooldown, daily run budget, kill switch) backed by a GCS
+    state object. Deliberately default-ON, unlike the other AUTOSRE_* flags:
+    those gate extra capabilities, this one is the spending ceiling, and an
+    unset AUTOSRE_STATE_URI makes the guard silently inert while every run
+    still answers "allowed" (see docs/cost-guard-runbook.md). The bucket is
+    created by this configuration, so default-on works on a fresh project with
+    no manual step.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "daily_run_limit" {
+  description = <<-EOT
+    AUTOSRE_DAILY_RUN_LIMIT: agent runs allowed per UTC day before the guard
+    trips its own kill switch (which then stays tripped until a human clears
+    it via POST /guard/killswitch). String because it is an env var.
+  EOT
+  type        = string
+  default     = "50"
+}
+
+variable "enable_autonomy" {
+  description = <<-EOT
+    Staged enablement for earned autonomy (docs/earned-autonomy.md): promoted
+    remediation classes recover WITHOUT a human approval click, after proving
+    the fix on a zero-traffic rehearsal revision. Default-off like the other
+    AUTOSRE_* flags, and deliberately kept off between demos on the live
+    project: the hourly demo-rearm job + autonomous recovery would otherwise
+    chase each other into ~24 merged PRs/day. Flip on for the stage, off after.
+    The trust ledger (GET /trust) stays readable either way.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "autonomy_threshold" {
+  description = <<-EOT
+    AUTOSRE_AUTONOMY_THRESHOLD: Wilson lower bound of verified successes a
+    class needs before it is promoted to autonomous execution. Empty uses the
+    application default (0.80). String because it is an env var.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "enable_report_video" {
+  description = <<-EOT
+    Staged enablement for video-attached user reports (Gemini reads the screen
+    recording directly). false keeps AUTOSRE_VIDEO_ENABLED empty = feature off,
+    matching the default-off contract of the other AUTOSRE_* capabilities.
+    The live demo runs with this on - set it (plus the two vars below) in
+    tfvars when reconciling against the live project.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "report_video_uri" {
+  description = <<-EOT
+    AUTOSRE_REPORT_VIDEO_URI: gs:// URI of the demo screen recording the agent
+    analyzes (live: gs://<project>-autosre-reports/report-recording.mp4).
+    Bucket and clip are created out-of-band, like the Model Armor template.
+    Only used when enable_report_video = true.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "report_video_bucket" {
+  description = <<-EOT
+    AUTOSRE_VIDEO_BUCKET: gs:// URI (including the gs:// prefix, matching the
+    live value) of the bucket holding report recordings. Created out-of-band.
+    Only used when enable_report_video = true.
+  EOT
+  type        = string
+  default     = ""
+}

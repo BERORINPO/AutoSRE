@@ -224,6 +224,62 @@ def read_state() -> dict:
     return {**empty_state(), **state, "enabled": True, "available": True}
 
 
+def read_demotions() -> dict:
+    """Per-class autonomy demotion records ({class_key: {ts, reason}}). Never raises.
+
+    An unreadable store returns {} — but autonomy's callers pair this with the
+    ledger read, which fails closed on its own; a missing demotion record can
+    only matter when the ledger IS readable, and both live in the same account,
+    so the split-brain window is the GCS blip itself. Accepted for demo scale.
+    """
+    state = read_state()
+    demoted = ((state.get("autonomy") or {}).get("demoted")) or {}
+    return demoted if isinstance(demoted, dict) else {}
+
+
+def set_demotion(class_key: str, reason: str = "", now: float | None = None) -> bool:
+    """Demote one autonomy class (empty reason with clear=True semantics is below).
+
+    Demotion is the one-strike rule: it must land durably before anyone reads
+    the ledger again, hence the same CAS discipline as the kill switch. Returns
+    False on any failure — the caller treats an unrecorded demotion as fatal
+    and refuses further autonomous action in-process.
+    """
+    return _mutate_demotions(lambda d: {**d, class_key: {"ts": now or time.time(), "reason": reason}})
+
+
+def clear_demotion(class_key: str) -> bool:
+    """Human re-arm: remove one class's demotion record."""
+    return _mutate_demotions(lambda d: {k: v for k, v in d.items() if k != class_key})
+
+
+def _mutate_demotions(fn) -> bool:
+    if not enabled():
+        return False
+    try:
+        blob = _blob()
+    except Exception:  # noqa: BLE001
+        return False
+    for _ in range(_CAS_ATTEMPTS):
+        try:
+            state, generation = _read(blob)
+        except Exception:  # noqa: BLE001
+            return False
+        state = {**empty_state(), **state}
+        autonomy = dict(state.get("autonomy") or {})
+        demoted = autonomy.get("demoted") or {}
+        autonomy["demoted"] = fn(demoted if isinstance(demoted, dict) else {})
+        state["autonomy"] = autonomy
+        try:
+            _write(blob, state, generation)
+        except Exception as e:  # noqa: BLE001
+            if type(e).__name__ == "PreconditionFailed":
+                continue
+            return False
+        return True
+    return False
+
+
 def set_killswitch(tripped: bool, reason: str = "", now: float | None = None) -> bool:
     """Trip or clear the kill switch. Returns True on success."""
     if not enabled():

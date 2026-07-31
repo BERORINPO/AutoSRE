@@ -127,6 +127,14 @@ class RunCost:
         of double counting or of a usage field we do not know about. A renderer
         can show the number and still say it does not reconcile, instead of
         quietly presenting a figure we cannot stand behind.
+
+        `accounted` alone cannot be read as "reconciled", though: it is also True
+        when the SDK reported no total at all (reported_total_tokens == 0), where
+        there was simply nothing to reconcile against. `reported_total_tokens` is
+        therefore emitted raw - 0 means "unverified", non-zero and equal to
+        input+output means actually cross-checked. Without it the two cases are
+        indistinguishable downstream, because total_tokens below already falls
+        back to our own sum.
         """
         usd = self.usd()
         summed = self.input_tokens + self.output_tokens
@@ -136,6 +144,8 @@ class RunCost:
             "output_tokens": self.output_tokens,
             "thought_tokens": self.thought_tokens,
             "total_tokens": self.reported_total_tokens or summed,
+            # 0 = the SDK reported no total, so `accounted` below is vacuous
+            "reported_total_tokens": self.reported_total_tokens,
             "model": self.model,
             "priced": usd is not None,
             "usd": round(usd, 6) if usd is not None else None,

@@ -32,6 +32,11 @@ from pydantic import BaseModel
 # state_store pulls only stdlib at import time — the storage client is lazy
 # inside it — and it gates every run-starting route, so it is on the hot path.
 from agents import state_store
+# Pure functions over the model's final answer; kept in their own stdlib-only
+# module so the offline gate can drive them without FastAPI/ADK installed.
+from agents.diagnosis import classify_outcome as _classify_outcome
+from agents.diagnosis import parse_diagnosis as _parse_diagnosis
+from agents.diagnosis import salvage_diagnosis as _salvage_diagnosis
 
 _UI_HTML = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
 
@@ -116,34 +121,6 @@ def smoke() -> JSONResponse:
         status_code=200 if overall_ok else 500,
         content={"overall_ok": overall_ok, "gemini": gemini, "logging": logging_result},
     )
-
-
-def _parse_diagnosis(text: str) -> dict:
-    """Tolerantly extract the agent's final JSON diagnosis (models sometimes wrap it in code fences)."""
-    if not text:
-        return {"error": "empty_final"}
-    t = text.strip()
-    if t.startswith("```"):
-        t = re.sub(r"^```(?:json)?", "", t).strip()
-        t = re.sub(r"```$", "", t).strip()
-    start, end = t.find("{"), t.rfind("}")
-    if start != -1 and end > start:
-        t = t[start : end + 1]
-    try:
-        return json.loads(t)
-    except Exception as e:  # noqa: BLE001
-        return {"error": f"parse_failed: {e}", "raw": text[:500]}
-
-
-def _classify_outcome(d: dict) -> str:
-    """Classify the agent's diagnosis into a single outcome label (frozen cross-worker contract)."""
-    if d.get("pr_url"):
-        return "pr_opened"
-    if d.get("action") == "escalate" or d.get("escalation"):
-        return "escalated"
-    if d.get("missing_env_var") is None:
-        return "healthy"
-    return "none"
 
 
 def _record_case(diagnosis: dict, source: str, service: str, started_ts: float) -> None:
@@ -246,16 +223,23 @@ async def incident(req: IncidentRequest, request: Request) -> dict:
             "raw_final": "",
             "error": str(e),
         }
-    diagnosis = _parse_diagnosis(result["final"])
+    diagnosis = _salvage_diagnosis(_parse_diagnosis(result["final"]), result.get("steps"))
     # to_thread: the sync BigQuery insert must not block the event loop
     # (a slow insert would freeze /events heartbeats on this single instance).
     await asyncio.to_thread(_record_case, diagnosis, "manual", req.service_name, started)
-    return {
+    # Earned autonomy (default-off): None leaves this response byte-identical.
+    autonomy_audit = await asyncio.to_thread(
+        _maybe_execute_autonomously, diagnosis, req.service_name, "manual"
+    )
+    response = {
         "steps": result["steps"],
         "outcome": _classify_outcome(diagnosis),
         "diagnosis": diagnosis,
         "raw_final": result["final"],
     }
+    if autonomy_audit is not None:
+        response["autonomy"] = autonomy_audit
+    return response
 
 
 def _check_console_key(request: Request) -> None:
@@ -340,10 +324,16 @@ async def incident_stream(request: Request) -> StreamingResponse:
             yield f"data: {json.dumps({'type': 'blocked', 'reason': reason})}\n\n"
             yield 'data: {"type": "done"}\n\n'
             return
+        diagnosis: dict = {}
+        # Kept so _salvage_diagnosis can consult what the tools actually did if
+        # the model's final JSON does not parse.
+        trace: list[dict] = []
         try:
             async for ev in run_incident_events(incident_text):
+                if ev.get("type") == "tool_result":
+                    trace.append({"name": ev.get("name"), "summary": ev.get("summary")})
                 if ev.get("type") == "final":
-                    diagnosis = _parse_diagnosis(ev["final"])
+                    diagnosis = _salvage_diagnosis(_parse_diagnosis(ev["final"]), trace)
                     run_cost = ev.get("cost")
                     await asyncio.to_thread(
                         _record_case, diagnosis, "console", "sida-target", started
@@ -359,6 +349,41 @@ async def incident_stream(request: Request) -> StreamingResponse:
                 yield f"data: {json.dumps(ev)}\n\n"
         except Exception as e:  # noqa: BLE001
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+            yield 'data: {"type": "done"}\n\n'
+            return
+        # Earned autonomy on the demo path. This is the same console the human
+        # would approve in, so the stream narrates each stage live and keeps
+        # the connection warm with comment frames while the pipeline works
+        # (rehearsal alone can take a quiet minute). None = feature off/not
+        # applicable -> the stream ends exactly as it did before this existed.
+        if diagnosis:
+            queue: asyncio.Queue = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def _emit_to_stream(step: dict) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, step)
+
+            pipeline = asyncio.ensure_future(
+                asyncio.to_thread(
+                    _maybe_execute_autonomously,
+                    diagnosis,
+                    "sida-target",
+                    "console",
+                    _emit_to_stream,
+                )
+            )
+            while not (pipeline.done() and queue.empty()):
+                try:
+                    step = await asyncio.wait_for(queue.get(), timeout=5.0)
+                    yield f"data: {json.dumps({'type': 'autonomy_step', **step})}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+            try:
+                audit = pipeline.result()
+            except Exception as e:  # noqa: BLE001 - narrate, never hang the stream
+                audit = {"outcome": "autonomy_error", "error": str(e)[:300]}
+            if audit is not None:
+                yield f"data: {json.dumps({'type': 'autonomy', 'audit': audit})}\n\n"
         yield 'data: {"type": "done"}\n\n'
 
     return StreamingResponse(
@@ -382,6 +407,216 @@ def reset(request: Request) -> dict:
         "inject": inject_failure("sida-target", "DATABASE_URL"),
         "repo_reset": reset_repo_config(),
     }
+
+
+def _maybe_execute_autonomously(
+    diagnosis: dict, service_name: str, source: str, emit=None
+) -> dict | None:
+    """Earned autonomy: close the loop with NO human click, iff this class earned it.
+
+    Runs after a diagnosis produced a fix PR. Every step fails closed to the
+    existing human gate: feature off, class not promoted, allowlist miss,
+    rehearsal not green -> return with serving traffic untouched and the PR
+    waiting for a human exactly as today. The one path that acts is:
+    promoted class -> fix proven green on a zero-traffic rehearsal revision ->
+    merge + traffic promote -> verify on the real URL. A failed verify reverts
+    traffic to the pre-fix revision and DEMOTES the class on the spot
+    (one strike); the failure is also recorded into the same ledger the
+    promotion was earned from.
+
+    Returns None when autonomy is off/irrelevant (response stays byte-identical
+    to today), else an audit dict the console renders as the post-hoc record.
+    """
+    from agents import autonomy
+
+    if not autonomy.enabled():
+        return None
+    env_var = diagnosis.get("missing_env_var")
+    pr_number = diagnosis.get("pr_number")
+    if diagnosis.get("action") != "fix_pr" or not env_var or not pr_number:
+        return None
+    from agents.github_tools import allowed_env_vars
+
+    if env_var not in allowed_env_vars():
+        return None
+
+    def _emit(stage: str, **fields) -> None:
+        """Progress callback for live surfaces (SSE stream / ambient broadcast).
+
+        A broken emitter must never break the recovery it is narrating."""
+        if emit is None:
+            return
+        try:
+            emit({"stage": stage, **fields})
+        except Exception:  # noqa: BLE001
+            pass
+
+    demotions = state_store.read_demotions()
+    promoted, evidence = autonomy.promoted_for(env_var, demotions)
+    result: dict = {
+        "class": autonomy.class_key(env_var),
+        "promoted": promoted,
+        "evidence": evidence,
+        "attempted": False,
+    }
+    if not promoted:
+        result["outcome"] = "gate_kept"
+        return result
+    _emit(
+        "engaged",
+        **{
+            "class": result["class"],
+            "successes": evidence.get("successes"),
+            "attempts": evidence.get("attempts"),
+            "wilson_lower_bound": evidence.get("wilson_lower_bound"),
+        },
+    )
+
+    from urllib.parse import urlsplit
+
+    from agents.case_store import record_resolution
+    from agents.recovery import (
+        merge_pull_request,
+        promote_rehearsal,
+        rehearse_env_fix,
+        revert_traffic,
+        verify_recovery,
+    )
+
+    value = os.environ.get(f"AUTOSRE_RESTORE_{env_var}", "")
+    result["attempted"] = True
+    _emit("rehearsal_started")
+    rehearsal = rehearse_env_fix(service_name, env_var, value)
+    result["rehearsal"] = rehearsal
+    if not rehearsal.get("ok"):
+        result["outcome"] = "rehearsal_error_gate_kept"
+        _emit("gate_kept", reason="rehearsal_error")
+        return result
+    _emit("rehearsal_deployed", url=rehearsal.get("rehearsal_url", ""))
+
+    health_url = os.environ.get("TARGET_HEALTH_URL", "")
+    health_path = urlsplit(health_url).path or "/health"
+    rehearsal_health = verify_recovery(
+        rehearsal["rehearsal_url"].rstrip("/") + health_path, timeout_s=90
+    )
+    result["rehearsal_health"] = rehearsal_health
+    if not rehearsal_health.get("recovered"):
+        # The fix did not prove itself next door -> nothing was risked, the
+        # serving revision never changed, and the PR waits for a human.
+        result["outcome"] = "rehearsal_red_gate_kept"
+        _emit("gate_kept", reason="rehearsal_red")
+        return result
+    _emit("rehearsal_green")
+
+    started = time.time()
+    result["merge"] = merge_pull_request(int(pr_number))
+    _emit("merged", pr_number=pr_number)
+    promote = promote_rehearsal(service_name)
+    result["promote"] = promote
+    _emit("promoted")
+    verify = verify_recovery(health_url)
+    result["verify"] = verify
+    recovered = bool(verify.get("recovered")) and bool(promote.get("ok"))
+    # Feed the SAME ledger the promotion was earned from - autonomous outcomes
+    # must count exactly like human-approved ones, or the statistics go blind
+    # right when the gate opens.
+    record_resolution(int(pr_number), recovered, time.time() - started)
+    if recovered:
+        result["outcome"] = "autonomous_recovery_verified"
+        _emit("verified", status_code=verify.get("status_code"))
+    else:
+        result["revert"] = revert_traffic(
+            service_name, rehearsal["snapshot"]["prev_revision"]
+        )
+        demoted = state_store.set_demotion(
+            result["class"], reason=f"autonomous verify failed (pr #{pr_number})"
+        )
+        result["demotion_recorded"] = demoted
+        _emit("reverted_demoted", revert_ok=bool(result["revert"].get("ok")))
+        result["outcome"] = "reverted_and_demoted"
+        print(
+            json.dumps(
+                {
+                    "severity": "ERROR" if demoted else "CRITICAL",
+                    "event": "autonomy_demoted",
+                    "class": result["class"],
+                    "pr_number": pr_number,
+                    "demotion_recorded": demoted,
+                    "source": source,
+                }
+            ),
+            flush=True,
+        )
+    _invalidate_console_meta()
+    return result
+
+
+@app.get("/trust")
+def trust_ledger(request: Request) -> dict:
+    """The trust ledger: per-class verified success record vs the promotion bar.
+
+    This endpoint IS the feature's honesty: it shows the gate's retirement
+    schedule before, during and after promotion, from the same BigQuery rows
+    the learning loop records - nothing here is asserted at pitch time. Key-
+    gated like /guard: which classes act without approval is operator data.
+    """
+    _check_console_key(request)
+    from agents import autonomy
+
+    return autonomy.ledger(state_store.read_demotions())
+
+
+class RearmRequest(BaseModel):
+    class_key: str
+
+
+@app.post("/trust/rearm")
+def trust_rearm(req: RearmRequest, request: Request) -> dict:
+    """Human re-arm of a demoted class. Deliberately the ONLY road back:
+    statistics can open the gate the first time, but after a strike the ledger
+    alone can never reopen it - a person has to look at what went wrong."""
+    _check_console_key(request)
+    from agents import autonomy
+
+    ok = state_store.clear_demotion(req.class_key)
+    return {"ok": ok, "ledger": autonomy.ledger(state_store.read_demotions())}
+
+
+class KillswitchRequest(BaseModel):
+    tripped: bool
+    reason: str = ""
+
+
+@app.get("/guard")
+def guard_state(request: Request) -> dict:
+    """Cost-guard state: armed or not, today's budget spend, kill switch.
+
+    Worth exposing at all because reserve_run() returns allowed=True with
+    reason="disabled" when AUTOSRE_STATE_URI is unset: an inert guard is
+    indistinguishable from a working one by watching runs succeed. read_state()
+    reports enabled/available separately and never raises, so "unconfigured" and
+    "unreachable" cannot masquerade as a healthy zero.
+
+    Key-gated rather than folded into the unauthenticated /console-meta: "the
+    guard is off" and "the budget is nearly spent" are precisely what someone
+    trying to burn the budget would want to read.
+    """
+    _check_console_key(request)
+    return state_store.read_state()
+
+
+@app.post("/guard/killswitch")
+def guard_killswitch(req: KillswitchRequest, request: Request) -> dict:
+    """Trip or clear the kill switch. Same key gate as /reset.
+
+    The daily-limit self-trip deliberately stays tripped until a human clears
+    it; without this route the only way to clear it was hand-editing the GCS
+    object, which is not something to be doing on stage. `ok` is False when the
+    store is not configured, so a no-op cannot read as a successful clear.
+    """
+    _check_console_key(request)
+    ok = state_store.set_killswitch(req.tripped, req.reason)
+    return {"ok": ok, "requested": req.tripped, "state": state_store.read_state()}
 
 
 @app.get("/user-reports")
@@ -731,12 +966,15 @@ async def pubsub_incident(request: Request) -> dict:
     # Stream the autonomous run to every open console (in-process broadcast), then
     # still return the same ack dict shape so the Pub/Sub push ack is unaffected.
     diagnosis: dict = {}
+    trace: list[dict] = []  # tool ground truth for _salvage_diagnosis
     started = time.time()
     _broadcast({"type": "run_started", "source": "pubsub"})
     try:
         async for ev in run_incident_events(incident_text):
+            if ev.get("type") == "tool_result":
+                trace.append({"name": ev.get("name"), "summary": ev.get("summary")})
             if ev.get("type") == "final":
-                diagnosis = _parse_diagnosis(ev["final"])
+                diagnosis = _salvage_diagnosis(_parse_diagnosis(ev["final"]), trace)
                 run_cost = ev.get("cost")
                 await asyncio.to_thread(
                     _record_case, diagnosis, "pubsub", "sida-target", started
@@ -759,10 +997,25 @@ async def pubsub_incident(request: Request) -> dict:
         _broadcast({"type": "error", "error": str(e)})
         _broadcast({"type": "done"})
         return {"status": "error", "error": str(e)[:300]}
+    # The 2am path: this handler had no human in it before the approval gate,
+    # and with a promoted class it now has none after it either. Broadcast the
+    # audit so any open console renders the post-hoc record live.
+    autonomy_audit = await asyncio.to_thread(
+        _maybe_execute_autonomously,
+        diagnosis,
+        "sida-target",
+        "pubsub",
+        lambda step: _broadcast({"type": "autonomy_step", **step}),
+    )
+    if autonomy_audit is not None:
+        _broadcast({"type": "autonomy", "audit": autonomy_audit})
     _broadcast({"type": "done"})
 
-    return {
+    response = {
         "status": "handled",
         "outcome": _classify_outcome(diagnosis),
         "diagnosis": diagnosis,
     }
+    if autonomy_audit is not None:
+        response["autonomy"] = autonomy_audit
+    return response
