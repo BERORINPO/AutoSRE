@@ -213,15 +213,29 @@ def reserve_run(
     return False, "conflict"
 
 
-def read_state() -> dict:
-    """Best-effort snapshot for the console. Never raises."""
+def read_state(now: float | None = None) -> dict:
+    """Best-effort snapshot for the console. Never raises.
+
+    The stored day/runs_today only move when a run is reserved, so a store last
+    written yesterday still carries yesterday's count. evaluate() rolls the day
+    forward at the next reserve, but a reader that repeats the stored number
+    verbatim answers "8 runs today" on a day that has had none - and the
+    pre-flight check before going on stage reads exactly this field. So roll the
+    day here too, without writing: the snapshot then says what the next run will
+    actually decide. The kill switch is deliberately not touched - a new day
+    restores the budget, not a trip that a human has yet to clear.
+    """
     if not enabled():
         return {**empty_state(), "enabled": False}
     try:
         state, _ = _read(_blob())
     except Exception:  # noqa: BLE001
         return {**empty_state(), "enabled": True, "available": False}
-    return {**empty_state(), **state, "enabled": True, "available": True}
+    snapshot = {**empty_state(), **state, "enabled": True, "available": True}
+    today = day_key(time.time() if now is None else now)
+    if snapshot.get("day") != today:
+        snapshot = {**snapshot, "day": today, "runs_today": 0}
+    return snapshot
 
 
 def read_demotions() -> dict:

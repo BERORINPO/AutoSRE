@@ -10,6 +10,7 @@ kept its own copy, so the intended 288 runs/day ceiling was really 5,760.
 Usage:
     python scripts/test_state_store_local.py
 """
+import json
 import os
 import sys
 import types
@@ -219,7 +220,7 @@ def test_cas_contention() -> None:
         (allowed, reason) == (True, "ok"),
         f"{allowed} {reason}",
     )
-    state = st.read_state()
+    state = st.read_state(now + 1)  # same simulated day as the reserves above
     check(
         "the retry did not double-count the run",
         state["runs_today"] == 2,
@@ -264,6 +265,59 @@ def test_failure_policy() -> None:
     )
 
 
+def test_read_state_day_rollover() -> None:
+    """The pre-flight check before going on stage reads runs_today. The store is
+    only rewritten when a run is reserved, so yesterday's count survives into a
+    day with no runs unless the reader rolls the day forward itself."""
+    reset(AUTOSRE_STATE_URI=URI, AUTOSRE_AUTO_COOLDOWN_S="0", AUTOSRE_DAILY_RUN_LIMIT="50")
+    now = 1_800_000_000.0
+    for i in range(8):
+        st.reserve_run(now + i)
+
+    same_day = st.read_state(now + 100)
+    check(
+        "within the same day the stored count is reported verbatim",
+        same_day["runs_today"] == 8 and same_day["day"] == st.day_key(now),
+        f"{same_day['day']} {same_day['runs_today']} - a live count must not be zeroed",
+    )
+
+    next_day = st.read_state(now + DAY_S)
+    check(
+        "a new UTC day reports zero runs, not yesterday's 8",
+        next_day["runs_today"] == 0,
+        f"runs_today={next_day['runs_today']} - the stage pre-flight would read "
+        "8/50 spent on a day with no runs",
+    )
+    check(
+        "the rolled snapshot carries today's date",
+        next_day["day"] == st.day_key(now + DAY_S),
+        f"day={next_day['day']}",
+    )
+    check(
+        "reporting does not write: the store still holds yesterday",
+        st.evaluate({}, now, 0, 50) and json.loads(BACKEND.data)["day"] == st.day_key(now),
+        f"stored day={json.loads(BACKEND.data)['day']} - read_state must not mutate the object",
+    )
+    check(
+        "the next reserve agrees with what was reported",
+        st.reserve_run(now + DAY_S + 1) == (True, "ok")
+        and st.read_state(now + DAY_S + 1)["runs_today"] == 1,
+        "the displayed budget must match the one the next run actually spends",
+    )
+
+    # A budget that resets overnight is not a kill switch that clears overnight.
+    reset(AUTOSRE_STATE_URI=URI, AUTOSRE_AUTO_COOLDOWN_S="0", AUTOSRE_DAILY_RUN_LIMIT="2")
+    st.reserve_run(now)
+    st.reserve_run(now + 1)
+    st.reserve_run(now + 2)  # trips the daily-limit self-stop
+    rolled = st.read_state(now + DAY_S)
+    check(
+        "a new day restores the budget but not a tripped kill switch",
+        rolled["runs_today"] == 0 and rolled["killswitch"]["tripped"] is True,
+        f"{rolled['runs_today']} {rolled['killswitch']} - it stays stopped until a human clears it",
+    )
+
+
 def test_env_parsing() -> None:
     reset(AUTOSRE_STATE_URI=URI, AUTOSRE_DAILY_RUN_LIMIT="abc", AUTOSRE_AUTO_COOLDOWN_S="abc")
     check("malformed daily limit -> default", st.daily_limit() == st.DEFAULT_DAILY_LIMIT, "")
@@ -285,6 +339,7 @@ def main() -> int:
     test_reserve_run()
     test_cas_contention()
     test_failure_policy()
+    test_read_state_day_rollover()
     test_env_parsing()
     reset()
 
