@@ -1007,8 +1007,27 @@ async function loadUserReports(){
 loadUserReports();
 loadConsoleMeta();
 loadTrust();
-refreshTarget();
-setInterval(refreshTarget, 15000);
+
+// 対象サービスのヘルス表示。デモ中は 503 -> 200 の反転が山場なので、見ている間は
+// 15 秒ごとに更新する。ただしこのタイマーは「見ている間だけ」動く必要がある:
+// 15 秒ポーリングは 1 リクエストあたりは軽いが、放置されたタブがサーバを温め続け、
+// 無人時の課金の床を実測で約 2 倍 (10 -> 21 課金インスタンス秒/時) にしていた。
+// SSE 側は既に同じ理由で「非表示なら切る / 無操作が続いたらやめる」規律を持っている
+// ので、ここでは新しい仕組みを足さず、その start/stop にこのタイマーを相乗りさせる。
+let healthTimer = null;
+const HEALTH_POLL_MS = 15000;
+
+function startHealthPolling(){
+  if(healthTimer) return;      // 冪等: 二重起動でリクエストを倍にしない
+  refreshTarget();             // 待たずに 1 回。戻ってきた画面に古い状態を映さない
+  healthTimer = setInterval(refreshTarget, HEALTH_POLL_MS);
+}
+
+function stopHealthPolling(){
+  if(!healthTimer) return;
+  clearInterval(healthTimer);
+  healthTimer = null;
+}
 
 // 自動検知の常時観測ストリーム。/events を購読していると、Pub/Sub 起点の
 // エージェント実行が始まったときに、誰も操作していなくてもタイムラインが動き出す。
@@ -1043,7 +1062,11 @@ function ambientHandle(e){
 }
 
 function ambientConnect(){
-  if(ambient || document.hidden) return;
+  if(document.hidden) return;
+  // ヘルスのポーリングも「見ている間だけ」に揃える。早期 return より前に置くのは、
+  // 購読が既に張られていてタイマーだけ落ちている状態からも復帰させるため。
+  startHealthPolling();
+  if(ambient) return;
   // 再接続時、EventSource が Last-Event-ID を自動送信するのでサーバが取りこぼしを再送する。
   ambient = new EventSource("/events");
   ambient.onmessage = ambientHandle;
@@ -1051,6 +1074,9 @@ function ambientConnect(){
 }
 
 function ambientDisconnect(){
+  // 購読が既に無くてもタイマーは止める（片方だけ生き残ると、止めたはずのタブが
+  // サーバを温め続ける = 今回直した不具合そのものになる）。
+  stopHealthPolling();
   if(!ambient) return;
   ambient.close();
   ambient = null;

@@ -179,6 +179,61 @@ def test_connection_is_bounded() -> None:
     )
 
 
+def _src(*parts: str) -> str:
+    path = os.path.join(os.path.dirname(__file__), "..", *parts)
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_console_health_poll_follows_attention() -> None:
+    """A tab nobody is looking at must not keep the service warm.
+
+    Bounding the SSE connection fixed the 3600s pin, but it left a second,
+    quieter leak: the target-health display was a bare top-level
+    ``setInterval``, so it outlived the hidden/idle discipline that governs the
+    subscription. Measured 2026-08-01, an abandoned tab doubled the unattended
+    floor (10 -> 21 billable instance-seconds per hour). Small in money, but it
+    is the same failure the SSE fix was supposed to end.
+
+    These are structural rules, not behaviour tests: reintroducing the bare
+    timer, or hiding either call behind the early return, fails here.
+    """
+    html = _src("packages", "agent", "src", "agents", "static", "index.html")
+
+    def body(fn: str) -> str:
+        start = html.index(f"function {fn}(")
+        return html[start : html.index("\n}", start)]
+
+    connect = body("ambientConnect")
+    disconnect = body("ambientDisconnect")
+
+    check("health poll starts from the ambient connect path", "startHealthPolling()" in connect)
+    check("health poll stops from the ambient disconnect path", "stopHealthPolling()" in disconnect)
+    check(
+        "the stop is not hidden behind the early return",
+        disconnect.index("stopHealthPolling()") < disconnect.index("if(!ambient) return"),
+        "a disconnect that returns before stopping leaves the timer running - "
+        "exactly the bug this test exists for",
+    )
+    check(
+        "the start is not hidden behind the early return",
+        connect.index("startHealthPolling()") < connect.index("if(ambient) return"),
+        "otherwise a live subscription with a dead timer never recovers",
+    )
+    check("connect still refuses while the tab is hidden", "if(document.hidden) return" in connect)
+    check(
+        "starting twice does not double the request rate",
+        "if(healthTimer) return;" in body("startHealthPolling"),
+    )
+
+    stray = [ln for ln in html.splitlines() if ln.startswith("setInterval(refreshTarget")]
+    check(
+        "no unconditional health timer at top level",
+        not stray,
+        f"found {stray} - a top-level timer polls forever, hidden or not",
+    )
+
+
 def main() -> int:
     test_parse_last_event_id()
     test_broadcast_sequences_and_fans_out()
@@ -186,6 +241,7 @@ def main() -> int:
     test_replay()
     test_replay_ttl_and_bound()
     test_connection_is_bounded()
+    test_console_health_poll_follows_attention()
     reset_bus()
 
     passed = sum(1 for _, ok, _ in results if ok)
