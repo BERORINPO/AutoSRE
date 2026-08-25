@@ -1,6 +1,8 @@
 # AutoSRE — an autonomous on-call SRE agent
 
-> **DevOps × AI Agent Hackathon 2026** submission (hosted by Findy, sponsored by Google Cloud).
+> **優秀賞 (Excellence Award)** — **DevOps × AI Agent Hackathon 2026** (hosted by Findy, sponsored by Google Cloud).
+>
+> Judged live on 2026-08-19: a Pub/Sub event started the run with zero clicks, the agent investigated on real logs and opened a real PR, and after one human approval `/health` flipped from 503 to 200 in 12 seconds — unattended, on stage.
 
 ![AutoSRE in action: a real Pub/Sub event starts the run with zero clicks, the agent investigates on real logs and opens a real PR, one human approval, and 503 flips to 200 with a drafted reply to the affected users](docs/media/hero.gif)
 
