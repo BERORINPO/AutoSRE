@@ -25,12 +25,6 @@ exit points of the loop.) Investigate / diagnose / propose are autonomous;
 merge + deploy stay behind a human approval gate — the 2026 industry consensus for
 irreversible actions (incident.io, Rootly, Azure SRE Agent).
 
-> **On the repo name:** `self-improving-devops-agent` is the north-star (see
-> [Roadmap](#roadmap-designed-for-deliberately-out-of-hackathon-scope) — a learned
-> per-scenario autonomy policy). The hackathon submission is **AutoSRE**, the working
-> foundation that self-improvement would sit on. Named for where it's going; judged on
-> what it does today.
-
 **Live demo:** https://sida-agent-860561433627.asia-northeast1.run.app
 
 ---
