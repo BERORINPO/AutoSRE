@@ -117,5 +117,10 @@ jobs:
           autosre --help > /dev/null
           # doctor exits 1 on this runner (no GCP config) - that IS the contract:
           # it must report, not crash. Anything other than 0/1 is a real failure.
-          autosre doctor; code=$?
-          [ "$code" = "0" ] || [ "$code" = "1" ] || { echo "doctor exited $code"; exit 1; }
+          # `if` rather than `cmd; code=$?`: this shell runs with -e, which would
+          # abort on the expected 1 before the check could read it.
+          if autosre doctor; then code=0; else code=$?; fi
+          case "$code" in
+            0|1) echo "doctor exited $code (reported, did not crash)" ;;
+            *) echo "doctor exited $code"; exit 1 ;;
+          esac
