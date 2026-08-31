@@ -21,10 +21,15 @@ What this gate is actually protecting:
 Usage:
     python scripts/test_cli_local.py
 """
+import importlib.util
 import io
 import os
 import sys
 from contextlib import redirect_stdout
+
+
+class _Skipped(Exception):
+    """A check that cannot run here (missing optional dep), reported as SKIP."""
 
 sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), "..", "packages", "agent", "src")
@@ -183,6 +188,61 @@ def test_parser_and_usage_exit() -> None:
     assert code == 0 and buf.getvalue().startswith("autosre ")
 
 
+def test_dry_run_is_enforced_at_the_write() -> None:
+    """--dry-run must be refused by the writer, not by the caller's good manners.
+
+    open_pull_request is the only function in the system that writes to GitHub.
+    With AUTOSRE_DRY_RUN set it must return before it touches the network - so
+    this asserts the refusal arrives with no GitHub token and no repo
+    configured, i.e. it could not have called out even if it wanted to.
+    """
+    if importlib.util.find_spec("httpx") is None:
+        # github_tools imports httpx at module level. CI installs it; a bare dev
+        # machine may not have it, and a silent pass would be a lie.
+        raise _Skipped("httpx is not installed")
+    from agents.github_tools import dry_run, open_pull_request
+
+    for value, expected in (("1", True), ("true", True), ("on", True),
+                            ("", False), ("0", False), ("no", False)):
+        os.environ["AUTOSRE_DRY_RUN"] = value
+        assert dry_run() is expected, f"AUTOSRE_DRY_RUN={value!r} read as {not expected}"
+
+    saved = {k: os.environ.pop(k, None) for k in ("GITHUB_TOKEN", "GITHUB_TARGET_REPO")}
+    try:
+        os.environ["AUTOSRE_DRY_RUN"] = "1"
+        result = open_pull_request("DATABASE_URL", "rehearsal")
+        assert result["ok"] is False and result["dry_run"] is True
+        assert "no pull request was opened" in result["error"]
+        assert "pr_url" not in result and "pr_number" not in result
+    finally:
+        os.environ.pop("AUTOSRE_DRY_RUN", None)
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_dry_run_wiring_in_the_cli() -> None:
+    from agents.cli import EXIT_OK, EXIT_USAGE, build_parser, main, outcome_exit_code
+
+    args = build_parser().parse_args(["run", "--dry-run"])
+    assert args.dry_run is True
+    # A rehearsal that reached a diagnosis is a success, not an escalation.
+    assert outcome_exit_code("dry_run") == EXIT_OK
+    # ...but a deployed agent cannot suppress its own writes, so the flag must
+    # be refused rather than silently ignored while a real PR is opened.
+    assert main(["run", "--dry-run", "--remote", "https://agent.example"]) == EXIT_USAGE
+
+
+def test_help_carries_examples() -> None:
+    """AC: `--help` alone has to be enough - with at least two worked examples."""
+    from agents.cli import build_parser
+
+    text = build_parser().format_help()
+    assert "examples:" in text
+    assert text.count("autosre ") >= 3, "the epilog lost its worked examples"
+    assert "--dry-run" in text and "exit codes:" in text
+
+
 def test_every_verb_is_wired() -> None:
     """A verb registered without a handler would only fail at runtime."""
     from agents.cli import build_parser
@@ -196,18 +256,22 @@ def test_every_verb_is_wired() -> None:
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    failures = 0
+    failures = skipped = 0
     for t in tests:
         try:
             t()
             print(f"PASS {t.__name__}")
+        except _Skipped as e:
+            skipped += 1
+            print(f"SKIP {t.__name__}: {e}")
         except AssertionError as e:
             failures += 1
             print(f"FAIL {t.__name__}: {e}")
         except Exception as e:  # noqa: BLE001
             failures += 1
             print(f"ERROR {t.__name__}: {type(e).__name__}: {e}")
-    print(f"\n{len(tests) - failures}/{len(tests)} passed")
+    tail = f" ({skipped} skipped)" if skipped else ""
+    print(f"\n{len(tests) - failures - skipped}/{len(tests)} passed{tail}")
     return 1 if failures else 0
 
 

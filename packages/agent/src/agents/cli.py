@@ -77,7 +77,7 @@ def outcome_exit_code(outcome: str) -> int:
     the label for a run whose final answer could not be read, and a script that
     treats that as success is the console-shows-green-over-a-503 bug again.
     """
-    if outcome in ("pr_opened", "healthy", "none"):
+    if outcome in ("pr_opened", "healthy", "none", "dry_run"):
         return EXIT_OK
     if outcome == "escalated":
         return EXIT_ESCALATED
@@ -307,6 +307,9 @@ def _run_local(args) -> dict:
     from agents.incident import build_incident_text, video_clause
 
     health_url = args.health_url or os.environ.get("TARGET_HEALTH_URL", "")
+    if getattr(args, "dry_run", False):
+        # Armed for the whole process, and read by open_pull_request itself.
+        os.environ["AUTOSRE_DRY_RUN"] = "1"
     # Operator-initiated, like the console button: skip the alert-storm cooldown,
     # but still charge the daily budget and obey the kill switch. A CLI that
     # sidesteps the guard would make the guard a property of one adapter.
@@ -352,6 +355,14 @@ def _run_local(args) -> dict:
 
     started = time.time()
     result = asyncio.run(drive())
+    if getattr(args, "dry_run", False):
+        # A suppressed run is not a case. Recording it would put an incident
+        # with no remediation into the memory the trust ledger counts, i.e. a
+        # rehearsal would move the bar that decides what may act unattended.
+        if result.get("outcome") not in ("undetermined",) and not result.get("error"):
+            result["outcome"] = "dry_run"
+        result["dry_run"] = True
+        return result
     if result.get("diagnosis"):
         from agents.case_store import record_diagnosis  # default-off, never raises
 
@@ -375,6 +386,9 @@ def _print_run_result(result: dict) -> None:
         print(f"variable:   {diagnosis['missing_env_var']}")
     if diagnosis.get("confidence") is not None:
         print(f"confidence: {diagnosis['confidence']}")
+    if result.get("dry_run"):
+        print("dry run:    no pull request was opened. Re-run without --dry-run to "
+              "let the agent propose the fix for real.")
     if diagnosis.get("pr_url"):
         print(f"fix PR:     {diagnosis['pr_url']}")
         print()
@@ -393,6 +407,12 @@ def _print_run_result(result: dict) -> None:
 
 
 def cmd_run(args) -> int:
+    if args.dry_run and args.remote:
+        # The deployed service has no dry-run mode, so honouring the flag over
+        # HTTP would mean opening a real PR while claiming not to.
+        print("--dry-run is a local mode; a deployed agent cannot suppress its own "
+              "writes. Drop --remote to rehearse.", file=sys.stderr)
+        return EXIT_USAGE
     result = _run_remote(args) if args.remote else _run_local(args)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -500,10 +520,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="autosre",
         description="AutoSRE - an autonomous on-call SRE agent, from your terminal.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "exit codes: 0 ok (PR opened, or the service really is healthy), "
-            "1 error/undetermined, 2 usage, 3 escalated (needs a human), "
-            "4 blocked by the cost guard."
+            "examples:\n"
+            "  autosre doctor                        what is this machine still missing?\n"
+            "  autosre run --dry-run                 investigate and diagnose, open no PR\n"
+            "  autosre run                           ...and open the fix PR for real\n"
+            "  autosre approve 42                    merge it, apply it, verify /health\n"
+            "  autosre status --json                 guard + ledger, machine-readable\n"
+            "  autosre run --remote https://agent.example --key $AUTOSRE_CONSOLE_KEY\n"
+            "                                        drive an already-deployed agent\n"
+            "\n"
+            "exit codes:\n"
+            "  0  a fix PR was opened, the service is genuinely healthy, or a dry run\n"
+            "  1  error - including 'undetermined', an answer that could not be read\n"
+            "  2  usage\n"
+            "  3  escalated: outside the auto-remediation allowlist, a human must act\n"
+            "  4  blocked by the cost guard (cooldown, daily limit, kill switch)\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"autosre {VERSION}")
@@ -526,6 +559,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help=f"target Cloud Run service (default: {DEFAULT_SERVICE})")
     run.add_argument("--health-url", help="target health endpoint (default: $TARGET_HEALTH_URL)")
     run.add_argument("--video-ref", help="gs:// URI of a screen recording attached to the report")
+    run.add_argument("--dry-run", action="store_true",
+                     help="investigate and diagnose, but open no PR (local runs only)")
     run.set_defaults(func=cmd_run)
 
     approve = sub.add_parser("approve", help="merge the fix PR, apply it, verify recovery")

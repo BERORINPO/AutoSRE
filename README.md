@@ -165,10 +165,16 @@ the same ReAct loop, the same cost guard, and the same approval gate the console
 pip install -e packages/agent   # puts `autosre` on PATH
 
 autosre doctor                  # what is this machine still missing?
-autosre run                     # investigate -> diagnose -> open the fix PR
+autosre run --dry-run           # investigate and diagnose, open no PR
+autosre run                     # ...and open the fix PR for real
 autosre approve 42              # the gate: merge, apply, verify /health is 200 again
 autosre status                  # cost guard budget, trust ledger, target health
 ```
+
+`--dry-run` is enforced inside `open_pull_request` — the one function that writes to
+GitHub — not by the caller remembering to behave. A rehearsal is also kept out of case
+memory: the trust ledger counts verified recoveries, and a run that never proposed a fix
+must not move the bar that decides what may act unattended.
 
 `doctor` runs first for a reason: it reports the configuration, the packages and the
 Google credentials as a checklist with the fix on each failing line, instead of failing
