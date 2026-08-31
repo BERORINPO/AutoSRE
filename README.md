@@ -135,6 +135,8 @@ considered choice, not a default:
 packages/agent/
   src/agents/
     server.py        FastAPI app: / (console), /incident, /approve, /target-health, /health, /smoke
+    cli.py           the `autosre` command: doctor / run / approve / status
+    incident.py      the incident prompt, shared by every entry point
     agent.py         ADK ReAct agent (build_agent, run_incident)
     tools.py         read-only investigation tools (Cloud Run + Logging + health probe)
     github_tools.py  open_pull_request (autonomous)
@@ -148,6 +150,52 @@ scripts/
   test_recovery_local.py   local recovery validation
 docs/sprint-4day-autosre.md  the plan + engineering log
 ```
+
+## Use it from a terminal — the `autosre` CLI
+
+The agent has three entry points onto **one** core: a Pub/Sub push (the 2am path), the
+web console, and this command. Nothing is reimplemented for the CLI — `autosre run` is
+the same ReAct loop, the same cost guard, and the same approval gate the console drives.
+
+```bash
+pip install -e packages/agent   # puts `autosre` on PATH
+
+autosre doctor                  # what is this machine still missing?
+autosre run --dry-run           # investigate and diagnose, open no PR
+autosre run                     # ...and open the fix PR for real
+autosre approve 42              # the gate: merge, apply, verify /health is 200 again
+autosre status                  # cost guard budget, trust ledger, target health
+```
+
+`--dry-run` is enforced inside `open_pull_request` — the one function that writes to
+GitHub — not by the caller remembering to behave. A rehearsal is also kept out of case
+memory: the trust ledger counts verified recoveries, and a run that never proposed a fix
+must not move the bar that decides what may act unattended.
+
+`doctor` runs first for a reason: it reports the configuration, the packages and the
+Google credentials as a checklist with the fix on each failing line, instead of failing
+later inside a run. Secrets are reported as `set (hidden)` and never echoed.
+
+Already have it deployed? Every verb takes `--remote` and talks to the running service
+over the same routes the console uses, so nothing needs to be configured locally:
+
+```bash
+autosre run --remote https://your-agent.run.app --key "$AUTOSRE_CONSOLE_KEY"
+```
+
+Exit codes, because this is meant to be scriptable:
+
+| code | meaning |
+|------|---------|
+| `0` | a fix PR was opened, or the service really is healthy |
+| `1` | error — including `undetermined`, i.e. the final answer could not be read |
+| `2` | usage |
+| `3` | escalated: the fix is outside the auto-remediation allowlist, a human must act |
+| `4` | blocked by the cost guard (cooldown, daily limit, kill switch) |
+
+`undetermined` deliberately exits non-zero: a run whose answer could not be parsed is
+not a healthy service. That distinction came from a real production failure — see
+`agents/diagnosis.py`.
 
 ## Run the demo
 

@@ -40,6 +40,15 @@ def allowed_env_vars() -> set:
     }
 
 
+def dry_run() -> bool:
+    """Whether writes to GitHub are suppressed for this process.
+
+    Read at call time like allowed_env_vars(), and only ever able to STOP a
+    write - so a stale value can cost a run, never a repository.
+    """
+    return os.environ.get("AUTOSRE_DRY_RUN", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _repo() -> str:
     return os.environ.get("GITHUB_TARGET_REPO", "")
 
@@ -131,6 +140,17 @@ def open_pull_request(missing_env_var: str, root_cause: str) -> dict:
         root_cause: a one-line root-cause summary for the PR description.
     """
     try:
+        if dry_run():
+            # `autosre run --dry-run`: the investigation is real, the write is
+            # not. Suppressed HERE, at the only function that writes to GitHub,
+            # rather than in the CLI - a dry run that depended on the caller
+            # remembering to disarm the tool would eventually open a PR.
+            return {
+                "ok": False,
+                "dry_run": True,
+                "error": f"dry run: no pull request was opened for '{missing_env_var}' "
+                "(AUTOSRE_DRY_RUN is set); the diagnosis itself is unaffected",
+            }
         repo = _repo()
         allowed = allowed_env_vars()
         if missing_env_var not in allowed:
