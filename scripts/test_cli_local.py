@@ -248,10 +248,134 @@ def test_every_verb_is_wired() -> None:
     from agents.cli import build_parser
 
     parser = build_parser()
-    for verb in ("doctor", "run", "approve", "status", "version"):
+    for verb in ("doctor", "run", "approve", "status", "watch", "version"):
         argv = [verb, "1"] if verb == "approve" else [verb]
         args = parser.parse_args(argv)
         assert callable(getattr(args, "func", None)), f"{verb} has no handler"
+
+
+def test_status_prints_the_ledger_it_is_actually_given() -> None:
+    """Regression: `status` read keys the trust ledger has never emitted.
+
+    autonomy.ledger() returns `class` / `wilson_lower_bound`; the renderer asked
+    for `class_key` / `lower_bound`, so the moment one class existed the format
+    spec hit None and the whole verb died with a TypeError. It shipped that way
+    because the only ledger the test suite had ever handed it was empty.
+    """
+    from agents import autonomy, cli
+
+    verdict = autonomy.evaluate_class(4, 4, None, 0.80)
+    ledger = {"enabled": True, "available": True, "threshold": 0.80,
+              "classes": [{"class": autonomy.class_key("DATABASE_URL"),
+                           "env_var": "DATABASE_URL", **verdict}]}
+
+    class _Args:
+        remote = None
+        json = False
+        health_url = ""
+
+    saved = (cli._collect_guard, cli._collect_ledger, cli._probe_health)
+    cli._collect_guard = lambda args: {"enabled": False, "available": False,
+                                       "runs_today": 0, "day": "2026-08-31",
+                                       "killswitch": {"tripped": False}}
+    cli._collect_ledger = lambda args: ledger
+    cli._probe_health = lambda url: {"ok": True, "status_code": 200, "healthy": True}
+    out = io.StringIO()
+    try:
+        with redirect_stdout(out):
+            code = cli.cmd_status(_Args())
+    finally:
+        cli._collect_guard, cli._collect_ledger, cli._probe_health = saved
+    text = out.getvalue()
+    assert code == cli.EXIT_OK
+    assert "restore_env:DATABASE_URL" in text, f"the class name never printed:\n{text}"
+    assert "lower_bound=0.51" in text, f"the evidence never printed:\n{text}"
+    assert "None" not in text, f"status printed a None where a field should be:\n{text}"
+
+
+def test_status_asks_the_route_the_server_actually_serves() -> None:
+    """Regression: `--remote` GET /trust-ledger 404'd - the route is /trust.
+
+    A remote path that no deployment serves is invisible to a unit test that
+    only checks the CLI, so this asserts the two halves against each other: the
+    paths the CLI asks for must exist on the FastAPI app in this repo.
+    """
+    from agents import cli
+
+    try:
+        from agents import server  # needs fastapi
+        import httpx  # noqa: F401 - _collect_pull_requests imports it
+    except ImportError as e:
+        raise _Skipped(f"server deps not installed here ({e})") from e
+
+    routes = {getattr(r, "path", None) for r in server.app.routes}
+    for path in ("/trust", "/guard", "/pull-requests"):
+        assert path in routes, f"{path} is not served: {sorted(p for p in routes if p)}"
+
+    asked = []
+
+    class _Args:
+        remote = "https://agent.example"
+        key = "k"
+        json = True
+        service = "sida-target"
+
+    saved = cli._request
+    cli._request = lambda args, method, path, body=None, timeout=None: (
+        asked.append(path) or {})
+    try:
+        cli._collect_guard(_Args())
+        cli._collect_ledger(_Args())
+        cli._collect_pull_requests(_Args())
+    finally:
+        cli._request = saved
+    assert asked == ["/guard", "/trust", "/pull-requests"], asked
+
+
+def test_remote_queue_falls_back_when_the_route_is_missing() -> None:
+    """An agent deployed before /pull-requests must not read as an empty queue.
+
+    "I could not ask" and "nothing is waiting" are the same pixels on a screen
+    and opposite facts during an incident, so the fallback has to say which.
+    """
+    try:
+        import httpx
+    except ImportError as e:
+        raise _Skipped(f"httpx is not installed ({e})") from e
+
+    from agents import cli, github_tools
+
+    class _Args:
+        remote = "https://agent.example"
+        key = ""
+        json = True
+
+    def _fail(status):
+        def _raise(*a, **k):
+            raise httpx.HTTPStatusError(
+                "nope",
+                request=httpx.Request("GET", "https://agent.example/pull-requests"),
+                response=httpx.Response(status),
+            )
+        return _raise
+
+    saved = (cli._request, github_tools.list_open_fix_prs)
+    github_tools.list_open_fix_prs = lambda limit=10: {"ok": True, "count": 0,
+                                                       "pull_requests": []}
+    try:
+        cli._request = _fail(404)
+        out = cli._collect_pull_requests(_Args())
+        assert out["ok"] is True and "older image" in out.get("note", ""), out
+        # Anything else is a real failure and must reach the panel as an error,
+        # not be quietly re-answered by a different source.
+        cli._request = _fail(500)
+        try:
+            cli._collect_pull_requests(_Args())
+            raise AssertionError("a 500 from the deployed agent was swallowed")
+        except httpx.HTTPStatusError:
+            pass
+    finally:
+        cli._request, github_tools.list_open_fix_prs = saved
 
 
 def main() -> int:

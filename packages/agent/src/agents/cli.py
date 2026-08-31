@@ -10,6 +10,7 @@ the same core from a terminal:
     autosre run               # investigate -> diagnose -> open the fix PR
     autosre approve <pr>      # the human gate: merge, apply, verify recovery
     autosre status            # cost guard budget, trust ledger, target health
+    autosre watch             # the same, live: approval queue + ledger on screen
 
 Design constraints:
 
@@ -38,6 +39,7 @@ EXIT_ESCALATED = 3  # ran fine, but the fix is outside the auto-remediation poli
 EXIT_BLOCKED = 4  # the cost guard / kill switch refused to start the run
 
 DEFAULT_SERVICE = "sida-target"
+DEFAULT_WATCH_INTERVAL_S = 10.0
 
 # Values that must never be echoed back to a terminal or a log.
 _SECRET_KEYS = frozenset({"GITHUB_TOKEN", "AUTOSRE_CONSOLE_KEY"})
@@ -473,15 +475,67 @@ def cmd_approve(args) -> int:
     return EXIT_OK if verified else EXIT_ERROR
 
 
-def cmd_status(args) -> int:
+def _collect_guard(args) -> dict:
+    """Cost-guard state. Local reads add the configured ceiling, which the
+    stored object does not carry - "12 runs today" is not a budget on its own."""
     if args.remote:
-        guard = _request(args, "GET", "/guard", timeout=60.0)
-        ledger = _request(args, "GET", "/trust-ledger", timeout=60.0)
-    else:
-        from agents import autonomy, state_store
+        return _request(args, "GET", "/guard", timeout=60.0)
+    from agents import state_store
 
-        guard = state_store.read_state()
-        ledger = autonomy.ledger(state_store.read_demotions())
+    return {**state_store.read_state(), "daily_limit": state_store.daily_limit()}
+
+
+def _collect_ledger(args) -> dict:
+    if args.remote:
+        # The route is /trust. This said /trust-ledger until 2026-08-31 and had
+        # never been run against a deployment, so `status --remote` 404'd.
+        return _request(args, "GET", "/trust", timeout=60.0)
+    from agents import autonomy, state_store
+
+    return autonomy.ledger(state_store.read_demotions())
+
+
+def _collect_cases(args) -> dict:
+    """Recent diagnoses for the service. Always read locally: case memory is
+    BigQuery and the deployed service exposes no route for it, so with --remote
+    this reports "off" rather than inventing an empty history."""
+    from agents.case_store import recall_similar_cases
+
+    return recall_similar_cases(args.service)
+
+
+def _collect_pull_requests(args) -> dict:
+    """The approval queue: open `autosre/*` fix PRs.
+
+    With --remote the deployed service answers, so a laptop with no GitHub
+    token can still watch the queue. An agent deployed before /pull-requests
+    existed answers 404 - fall back to this machine's token and say so, rather
+    than showing an empty queue that means "I could not ask".
+    """
+    try:
+        import httpx
+
+        from agents.github_tools import list_open_fix_prs
+    except ImportError as e:
+        # The screen is often the first thing run on a fresh machine, so point
+        # at the verb that lists everything missing instead of a bare traceback.
+        return {"ok": False, "error": f"{e} - run `autosre doctor`"}
+
+    if not args.remote:
+        return list_open_fix_prs()
+    try:
+        return _request(args, "GET", "/pull-requests", timeout=60.0)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 404:
+            raise
+    local = list_open_fix_prs()
+    return {**local, "note": "the deployed agent has no /pull-requests route "
+                             "(older image) - read with this machine's token"}
+
+
+def cmd_status(args) -> int:
+    guard = _collect_guard(args)
+    ledger = _collect_ledger(args)
     health = _probe_health(args.health_url or os.environ.get("TARGET_HEALTH_URL", ""))
     payload = {"guard": guard, "ledger": ledger, "target_health": health}
 
@@ -496,17 +550,51 @@ def cmd_status(args) -> int:
     print()
     print("trust ledger (which classes may act without a click):")
     classes = ledger.get("classes") or []
-    if not classes:
+    if ledger.get("available") is False:
+        # "off" and "unreadable" are not "nothing has been earned yet".
+        print(f"  (unavailable: {ledger.get('reason') or 'the ledger did not answer'})")
+    elif not classes:
         print("  (no verified recoveries recorded yet - every class stays behind the gate)")
     for c in classes:
-        print(f"  {c.get('class_key'):<24} {c.get('successes')}/{c.get('attempts')} "
-              f"lower_bound={c.get('lower_bound')} promoted={c.get('promoted')}")
+        state = ("demoted" if c.get("demoted")
+                 else "promoted" if c.get("promoted") else "gated")
+        print(f"  {str(c.get('class') or '?'):<28} {c.get('successes')}/{c.get('attempts')} "
+              f"lower_bound={c.get('wilson_lower_bound')} threshold={c.get('threshold')} "
+              f"{state}")
     print()
     if health.get("ok"):
         print(f"target health: HTTP {health['status_code']}")
     else:
         print(f"target health: unknown ({health.get('error')})")
     return EXIT_OK
+
+
+def _watch_collectors(args) -> dict:
+    """One callable per panel, in the order the screen draws them.
+
+    Injected rather than reached for, so the renderer stays pure and the
+    offline gate can drive a half-broken screen (see agents.tui.build_snapshot).
+    """
+    health_url = args.health_url or os.environ.get("TARGET_HEALTH_URL", "")
+    return {
+        "target_health": lambda: _probe_health(health_url),
+        "pull_requests": lambda: _collect_pull_requests(args),
+        "ledger": lambda: _collect_ledger(args),
+        "cases": lambda: _collect_cases(args),
+        "guard": lambda: _collect_guard(args),
+    }
+
+
+def cmd_watch(args) -> int:
+    from agents import tui  # stdlib-only, but keep the import where it is used
+
+    return tui.watch(
+        _watch_collectors(args),
+        meta={"service": args.service, "remote": args.remote},
+        interval=args.interval,
+        once=args.once,
+        as_json=args.json,
+    )
 
 
 def cmd_version(args) -> int:
@@ -529,6 +617,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  autosre run                           ...and open the fix PR for real\n"
             "  autosre approve 42                    merge it, apply it, verify /health\n"
             "  autosre status --json                 guard + ledger, machine-readable\n"
+            "  autosre watch                         live screen: what is waiting for you\n"
             "  autosre run --remote https://agent.example --key $AUTOSRE_CONSOLE_KEY\n"
             "                                        drive an already-deployed agent\n"
             "\n"
@@ -577,6 +666,18 @@ def build_parser() -> argparse.ArgumentParser:
     common(status)
     status.add_argument("--health-url")
     status.set_defaults(func=cmd_status)
+
+    watch = sub.add_parser(
+        "watch", help="live screen: approval queue, trust ledger, guard, recent incidents")
+    common(watch)
+    watch.add_argument("--service", default=DEFAULT_SERVICE)
+    watch.add_argument("--health-url")
+    watch.add_argument("--interval", type=float, default=DEFAULT_WATCH_INTERVAL_S,
+                       metavar="SECONDS",
+                       help=f"refresh cadence (default: {DEFAULT_WATCH_INTERVAL_S:.0f}s, min 2s)")
+    watch.add_argument("--once", action="store_true",
+                       help="render one frame and exit (for scripts and CI logs)")
+    watch.set_defaults(func=cmd_watch)
 
     version = sub.add_parser("version", help="print the version")
     common(version)

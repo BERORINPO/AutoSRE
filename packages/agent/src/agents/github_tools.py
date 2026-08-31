@@ -107,6 +107,54 @@ def get_user_reviews(limit: int = 10) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def list_open_fix_prs(limit: int = 10) -> dict:
+    """Open AutoSRE fix PRs - the approval queue, newest first. Never raises.
+
+    Identified by the branch prefix `open_pull_request` writes, not by author:
+    the token that opens the PR can be a bot, a PAT or a GitHub App depending
+    on how the operator deployed, and a queue that silently misses a PR because
+    the author string changed is worse than no queue at all.
+
+    Deliberately NOT registered as an agent tool. This is operator-facing data
+    (`autosre watch`); giving the model a way to read its own pending proposals
+    invites it to reason about approval instead of about the incident.
+
+    Args:
+        limit: max number of pull requests to return (default 10).
+    """
+    repo = _repo()
+    if not repo:
+        return {"ok": False, "error": "GITHUB_TARGET_REPO is not set"}
+    try:
+        with httpx.Client(base_url=API, headers=_headers(), timeout=20.0) as c:
+            r = c.get(
+                f"/repos/{repo}/pulls",
+                params={"state": "open", "sort": "created", "direction": "desc",
+                        "per_page": 100},
+            )
+            r.raise_for_status()
+            prs = [
+                {
+                    "number": p["number"],
+                    "title": p["title"],
+                    "url": p["html_url"],
+                    "branch": (p.get("head") or {}).get("ref"),
+                    "created_at": p.get("created_at"),
+                    "draft": bool(p.get("draft")),
+                }
+                for p in r.json()
+                if str(((p.get("head") or {}).get("ref") or "")).startswith("autosre/")
+            ]
+            return {"ok": True, "count": len(prs), "pull_requests": prs[:limit],
+                    "repo": repo}
+    except KeyError as e:  # GITHUB_TOKEN missing - _headers() raises this
+        return {"ok": False, "error": f"{e} is not set"}
+    except httpx.HTTPStatusError as e:
+        return {"ok": False, "error": f"GitHub {e.response.status_code}: {e.response.text[:200]}"}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 def apply_env_value(text: str, name: str, value: str) -> tuple[str, str]:
     """Set name=value in a .env-style file. Returns (new_text, change).
 
