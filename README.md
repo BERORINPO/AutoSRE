@@ -618,8 +618,10 @@ Three properties are deliberate:
 - **No dependencies.** Plain ANSI — no `curses` (a third-party wheel on Windows), no
   `textual`. Nothing to install before you can look at the ledger, and it degrades on its
   own: a console without ANSI prints scrolling frames, a non-tty prints one frame.
-- **It is never required.** Every panel is a view over what `autosre status --json` and
-  `autosre approve` already do; the screen has no capability the scriptable path lacks.
+- **It is never required.** Every panel is a view over data the CLI already exposes —
+  `autosre status --json` (guard, ledger, health), `autosre watch --once --json` (the whole
+  snapshot, queue included), `autosre approve` to act. The screen has no capability the
+  scriptable path lacks.
 - **Off, unreadable and empty stay three different sentences.** A disabled case store
   renders as *"off (AUTOSRE_CASES_TABLE unset)"*, never as an empty ledger — the same
   distinction `undetermined` earns in the exit codes.

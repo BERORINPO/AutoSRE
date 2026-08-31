@@ -160,10 +160,17 @@ def test_empty_and_degraded_snapshots_still_render() -> None:
 
 
 def test_off_is_not_empty() -> None:
-    """A disabled source must not render as 'nothing has happened yet'."""
+    """A disabled source must not render as 'nothing has happened yet'.
+
+    Both payloads are shaped the way agents.autonomy.ledger() really emits them:
+    "the case store is off" is available=False + reason, NOT enabled=False -
+    `enabled` on this payload is the autonomy arming flag (see the next test).
+    """
     from agents import tui
 
-    off = {"sections": {"ledger": {"enabled": False, "classes": []}}}
+    off = {"sections": {"ledger": {"enabled": False, "available": False,
+                                   "reason": "case memory disabled",
+                                   "threshold": 0.8, "classes": []}}}
     empty = {"sections": {"ledger": {"enabled": True, "available": True,
                                      "threshold": 0.8, "classes": []}}}
     off_text = "\n".join(tui.ledger_lines(off, 100))
@@ -171,6 +178,65 @@ def test_off_is_not_empty() -> None:
     assert "AUTOSRE_CASES_TABLE" in off_text, "off must name the switch that is off"
     assert "no verified recoveries recorded yet" in empty_text
     assert off_text != empty_text
+
+
+def test_ledger_panel_is_pinned_to_what_autonomy_really_emits() -> None:
+    """Regression, found in pre-merge review: the panel keyed "off" off `enabled`.
+
+    On the guard and the case store `enabled` means "this source is configured".
+    On the trust ledger it is AUTOSRE_AUTONOMY_ENABLED - which is off by default
+    and deliberately does NOT stop the ledger being readable. Keying the panel
+    off it made a populated ledger vanish behind "off (AUTOSRE_CASES_TABLE
+    unset)" on every normal install: the marquee panel blank, and the sentence
+    explaining it false. The old gate passed because it only ever paired
+    enabled=False with classes=[] - a combination ledger() never emits.
+
+    So this test drives the real producer instead of a hand-written shape.
+    """
+    from agents import autonomy, case_store, tui
+
+    saved_env = {k: os.environ.get(k)
+                 for k in ("AUTOSRE_CASES_TABLE", "AUTOSRE_AUTONOMY_ENABLED")}
+    saved_fns = (case_store.enabled, case_store.resolution_stats_by_env_var)
+    try:
+        os.environ.pop("AUTOSRE_CASES_TABLE", None)
+        os.environ.pop("AUTOSRE_AUTONOMY_ENABLED", None)
+
+        store_off = autonomy.ledger({})
+        assert store_off["enabled"] is False and store_off["available"] is False, store_off
+        text = "\n".join(tui.ledger_lines({"sections": {"ledger": store_off}}, 100))
+        assert "AUTOSRE_CASES_TABLE" in text, f"case memory off must name its switch:\n{text}"
+
+        # The shipped default: autonomy not armed, case memory on, evidence recorded.
+        case_store.enabled = lambda: True
+        case_store.resolution_stats_by_env_var = lambda: [
+            {"env_var": "DATABASE_URL", "successes": 20, "attempts": 20}]
+        default_install = autonomy.ledger({})
+        assert default_install["enabled"] is False, "autonomy is off by default"
+        assert default_install["available"] is True and default_install["classes"]
+
+        text = "\n".join(tui.ledger_lines({"sections": {"ledger": default_install}}, 110))
+        assert "restore_env:DATABASE_URL" in text, f"the ledger vanished:\n{text}"
+        assert "20/20 verified" in text and "PROMOTED" in text
+        assert "AUTOSRE_CASES_TABLE" not in text, f"false reason printed:\n{text}"
+        assert "autonomy off (reporting only)" in text, "the arming state is still reported"
+    finally:
+        case_store.enabled, case_store.resolution_stats_by_env_var = saved_fns
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_a_failed_ledger_read_claims_nothing_about_arming() -> None:
+    """No `enabled` key means no evidence - so do not print "autonomy off"."""
+    from agents import tui
+
+    broken = {"sections": {"ledger": {"error": "RuntimeError: 404 for .../trust"}}}
+    text = "\n".join(tui.ledger_lines(broken, 100))
+    assert "autonomy off" not in text and "autonomy ARMED" not in text, text
+    assert "arming unknown" in text and "unavailable" in text
 
 
 def test_demoted_beats_a_high_score() -> None:

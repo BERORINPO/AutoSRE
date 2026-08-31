@@ -19,10 +19,11 @@ Three deliberate constraints:
     what the offline gate drives, and it is why a half-broken snapshot (an
     unreadable ledger, a GitHub outage) draws a panel that says so instead of
     taking the screen down with a traceback.
-  * **The TUI is never required.** Every panel here is a view over data that
-    `autosre status --json` already prints; collectors are injected by the CLI
-    rather than reached for, so the screen can never grow a capability the
-    scriptable path does not have.
+  * **The TUI is never required.** Every panel here is a view over data the CLI
+    already prints - `autosre status --json` for the guard, the ledger and the
+    target, `autosre watch --once --json` for the whole snapshot including the
+    queue - and the collectors are injected by the CLI rather than reached for,
+    so the screen can never grow a capability the scriptable path does not have.
 
 ASCII only on purpose, same reason as `cli.format_step`: this runs in cmd.exe
 and PowerShell as often as in a UTF-8 terminal, and a UnicodeEncodeError in a
@@ -202,19 +203,32 @@ def _panel(title: str, right: str, width: int) -> list[str]:
     return [head, "-" * min(width, max(MIN_WIDTH, len(head)))]
 
 
-def _unavailable(payload: dict, disabled_note: str) -> str | None:
+def _unavailable(payload: dict, disabled_note: str, *, enabled_means_configured: bool = True,
+                 off_reason: str = "") -> str | None:
     """One line explaining why a panel has no rows, or None when it has data.
 
     "Off", "unreadable" and "empty" are three different states and the screen
     has to keep them apart - a disabled case store rendering as an empty ledger
     is the same class of lie as a green console over a 503.
+
+    `enabled` does NOT mean the same thing on every payload, which is exactly
+    how this helper told that lie once already. On the cost guard and the case
+    store it means "this source is configured" (state_store.read_state,
+    case_store.recall_similar_cases). On the trust ledger it is the
+    AUTOSRE_AUTONOMY_ENABLED arming flag, and the ledger is deliberately
+    readable while autonomy is off - so that caller passes
+    enabled_means_configured=False and names the `reason` string that really
+    does mean off.
     """
     if payload.get("error"):
         return f"unavailable: {field(payload['error'], 160)}"
-    if payload.get("enabled") is False:
+    if enabled_means_configured and payload.get("enabled") is False:
         return disabled_note
     if payload.get("available") is False:
-        return f"unreadable: {field(payload.get('reason') or 'source did not answer', 140)}"
+        reason = payload.get("reason") or "source did not answer"
+        if off_reason and reason == off_reason:
+            return disabled_note
+        return f"unreadable: {field(reason, 140)}"
     if payload.get("ok") is False:
         return f"unavailable: {field(payload.get('error') or 'source did not answer', 140)}"
     return None
@@ -264,13 +278,24 @@ def ledger_lines(snapshot: dict, width: int) -> list[str]:
     """The trust ledger: evidence, the bar, and the distance left to promotion."""
     book = section(snapshot, "ledger")
     thr = book.get("threshold")
-    armed = "autonomy ARMED" if book.get("enabled") else "autonomy off (reporting only)"
+    # Only claim an arming state when the payload actually carries one: a failed
+    # read has no `enabled` key, and "autonomy off" would then be an assertion
+    # made from no evidence, printed directly above "I could not read this".
+    if "enabled" in book:
+        armed = "autonomy ARMED" if book.get("enabled") else "autonomy off (reporting only)"
+    else:
+        armed = "arming unknown"
     lines = _panel(
         "trust ledger - what may act without a click",
         f"threshold {thr:.2f}   {armed}" if isinstance(thr, (int, float)) else armed,
         width,
     )
-    note = _unavailable(book, "off (AUTOSRE_CASES_TABLE unset - no verified record kept)")
+    # `enabled` here is AUTOSRE_AUTONOMY_ENABLED, not "the case store is on" -
+    # autonomy is off by default and the ledger is still readable, so keying the
+    # panel off it hid a populated ledger on every normal install. The ledger's
+    # own word for "the store is off" is available=False + this reason string.
+    note = _unavailable(book, "off (AUTOSRE_CASES_TABLE unset - no verified record kept)",
+                        enabled_means_configured=False, off_reason="case memory disabled")
     if note:
         return lines + [clip("  " + note, width), ""]
     classes = book.get("classes") or []
@@ -432,8 +457,10 @@ class Screen:
 
     Two fallbacks matter and both keep the screen useful: a console that cannot
     do ANSI prints successive frames (scrolling, still auto-refreshing), and a
-    stdin that is not a tty just sleeps out the interval - so `autosre watch`
-    piped into a file behaves like a slow log instead of blocking on a key read.
+    stdin that is not a tty sleeps the interval out instead of blocking on a key
+    read - so a redirected stdin still refreshes, it just cannot be steered.
+    (A non-tty *stdout* never reaches this class at all: `watch` prints one
+    frame and returns, which is what a pipe or a CI log wants.)
     """
 
     def __init__(self, stream=None):
