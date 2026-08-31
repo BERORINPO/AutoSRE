@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autosre"
+version = "0.1.0"
+description = "AutoSRE - an autonomous on-call SRE agent for Google Cloud Run"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dynamic = ["dependencies"]
+
+[project.urls]
+Homepage = "https://github.com/BERORINPO/autosre"
+
+# The terminal entry point. `pip install -e packages/agent` puts `autosre` on
+# PATH; the module underneath is the same core the Cloud Run service runs, so
+# there is no second implementation to keep in step.
+[project.scripts]
+autosre = "agents.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+# Only the agent package is installed. src/eval is the offline eval harness -
+# a top-level "eval" package in site-packages would be a name nobody expects.
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["agents*"]
+
+# server.py reads the console HTML at import time; an installed copy without it
+# would fail on import rather than at first request.
+[tool.setuptools.package-data]
+agents = ["static/*"]
+
+# Single source of truth for runtime deps: the same requirements.txt the
+# Dockerfile installs. Two dependency lists would eventually disagree, and the
+# one that broke would be the one nobody deploys.
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }

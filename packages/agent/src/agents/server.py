@@ -37,6 +37,11 @@ from agents import state_store
 from agents.diagnosis import classify_outcome as _classify_outcome
 from agents.diagnosis import parse_diagnosis as _parse_diagnosis
 from agents.diagnosis import salvage_diagnosis as _salvage_diagnosis
+# The incident prompt itself, shared with the CLI adapter so the three entry
+# points here and `autosre run` cannot drift into different agents. Stdlib-only
+# at import time (the video tool it consults is imported lazily inside).
+from agents.incident import build_incident_text as _build_incident_text
+from agents.incident import video_clause as _video_clause
 
 _UI_HTML = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
 
@@ -153,28 +158,6 @@ def _log_run_cost(cost: dict | None, source: str) -> None:
     _invalidate_console_meta()
 
 
-def _video_clause(video_ref: str | None) -> str:
-    """Append a screen-recording hint to the incident prompt when one is available.
-
-    Precedence: an explicit per-request video_ref, else AUTOSRE_REPORT_VIDEO_URI
-    (the demo default). Empty on both -> "" -> the agent never calls the video
-    tool = current behavior. Keeps the video feature staged/default-off."""
-    from agents.video_tools import enabled as _video_enabled
-
-    if not _video_enabled():
-        return ""  # feature off -> never mention a video (also avoids a wasted tool call)
-    ref = (video_ref or os.environ.get("AUTOSRE_REPORT_VIDEO_URI", "")).strip()
-    # Only splice a STRICT gs:// URI into the instruction. Rejecting whitespace/prose
-    # means a caller-controlled video_ref cannot carry a prompt-injection payload. (CISO M-1)
-    if not ref or not re.fullmatch(r"gs://[\w.\-/]+", ref):
-        return ""
-    return (
-        f" A user attached a screen recording at {ref}. "
-        "Call analyze_report_video on it to extract the reproduction steps and timeline "
-        "before you diagnose."
-    )
-
-
 class IncidentRequest(BaseModel):
     service_name: str = "sida-target"
     target_health_url: str | None = None
@@ -193,10 +176,7 @@ async def incident(req: IncidentRequest, request: Request) -> dict:
     from agents.agent import run_incident
 
     health_url = req.target_health_url or os.environ.get("TARGET_HEALTH_URL", "")
-    incident_text = (
-        f"Incident: the Cloud Run service '{req.service_name}' is reported unhealthy. "
-        f"Its health endpoint is {health_url}. Investigate and diagnose the single root cause."
-    )
+    incident_text = _build_incident_text(req.service_name, health_url)
     incident_text += _video_clause(req.video_ref)
     started = time.time()
     # Operator-initiated: no storm cooldown, but it still spends daily budget and
@@ -307,10 +287,7 @@ async def incident_stream(request: Request) -> StreamingResponse:
     from agents.agent import run_incident_events
 
     health_url = os.environ.get("TARGET_HEALTH_URL", "")
-    incident_text = (
-        "Incident: the Cloud Run service 'sida-target' is reported unhealthy. "
-        f"Its health endpoint is {health_url}. Investigate and diagnose the single root cause."
-    )
+    incident_text = _build_incident_text("sida-target", health_url)
     incident_text += _video_clause(None)
 
     async def gen():
@@ -947,10 +924,7 @@ async def pubsub_incident(request: Request) -> dict:
     from agents.agent import run_incident_events  # lazy import (matches /incident/stream)
 
     health_url = os.environ.get("TARGET_HEALTH_URL", "")
-    incident_text = (
-        "Incident auto-detected by Cloud Monitoring: the Cloud Run service 'sida-target' is unhealthy. "
-        f"Its health endpoint is {health_url}. Investigate and diagnose the single root cause."
-    )
+    incident_text = _build_incident_text("sida-target", health_url, source="alert")
     if detail:
         # Screen the (semi-trusted) alert payload for injection before splicing it
         # into the prompt (Model Armor; default-off no-op). Fail-open + annotate:

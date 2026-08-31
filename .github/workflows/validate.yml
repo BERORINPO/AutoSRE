@@ -102,3 +102,20 @@ jobs:
           python scripts/test_env_patch_local.py
           python scripts/test_cost_accounting_local.py
           python scripts/test_autonomy_local.py
+          python scripts/test_cli_local.py
+
+      # The CLI is the entry point a stranger uses first, so the install path
+      # itself is a gate: a broken pyproject or a renamed console script would
+      # otherwise only be found by that stranger. --no-deps because the runtime
+      # deps were installed from requirements.txt above.
+      - name: CLI entry point (editable install + doctor)
+        if: steps.detect.outputs.exists == 'true'
+        shell: bash
+        run: |
+          pip install --no-deps -e packages/agent
+          autosre version
+          autosre --help > /dev/null
+          # doctor exits 1 on this runner (no GCP config) - that IS the contract:
+          # it must report, not crash. Anything other than 0/1 is a real failure.
+          autosre doctor; code=$?
+          [ "$code" = "0" ] || [ "$code" = "1" ] || { echo "doctor exited $code"; exit 1; }
