@@ -145,7 +145,7 @@ PowerShell: `$env:PROJECT_ID = "your-gcp-project-id"`, and so on. Every `gcloud`
 
 ```bash
 git clone https://github.com/BERORINPO/AutoSRE.git
-cd autosre
+cd AutoSRE
 pip install -e packages/agent      # puts `autosre` on PATH
 autosre version
 ```
