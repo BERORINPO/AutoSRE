@@ -1,18 +1,28 @@
-# AutoSRE — an autonomous on-call SRE agent
+# AutoSRE - an autonomous on-call SRE agent
 
-> **優秀賞 (Excellence Award)** — **DevOps × AI Agent Hackathon 2026** (hosted by Findy, sponsored by Google Cloud).
->
-> Judged live on 2026-08-19: a Pub/Sub event started the run with zero clicks, the agent investigated on real logs and opened a real PR, and after one human approval `/health` flipped from 503 to 200 in 12 seconds — unattended, on stage.
+**When a deploy breaks at 2am, AutoSRE reads the user complaints, tails the real logs,
+finds the cause and opens a fix PR - then, after one human approval, verifies `/health`
+is 200 again.** It is a Google ADK agent that runs the on-call investigate-and-repair
+loop on Cloud Run, and stops at the approval gate before anything irreversible.
+
+**[Quickstart](#quickstart--from-an-empty-gcp-project-to-your-first-autonomous-fix) - 15 minutes from an empty GCP project to your first diagnosis.**
+
+| Measured | |
+|---|---|
+| Correct diagnosis | **90.2%** (n=51, offline eval) |
+| Investigation -> fix PR opened | **27-30 s** |
+| Approval -> `/health` back to 200 | **12 s** (measured on stage, 2026-08-19) |
+| One full run | **~$0.013** (8 LLM calls, 32k tokens) |
+
+> DevOps x AI Agent Hackathon (Findy x Google Cloud, 2026) - **優秀賞 (Excellence Award)**
 
 ![AutoSRE in action: a real Pub/Sub event starts the run with zero clicks, the agent investigates on real logs and opens a real PR, one human approval, and 503 flips to 200 with a drafted reply to the affected users](docs/media/hero.gif)
 
-When a deploy breaks at 2am, someone has to read the logs, find the cause, write the
-fix, ship it — and verify it actually recovered. Solo founders and small teams don't
-have an on-call SRE for that. **AutoSRE is an AI agent that runs the on-call
-investigate-and-repair loop autonomously, and stops for your approval before it
-changes anything.**
+Solo founders and small teams have no on-call SRE for 2am, and the loop still has to be
+run by someone: read the logs, find the cause, write the fix, ship it, verify it
+recovered.
 
-It even starts where the pain does: AutoSRE reads the **real user reports** (complaints
+AutoSRE starts where the pain does. It reads the **real user reports** (complaints
 in the project's issue tracker), correlates them with the live system state, fixes the
 root cause, and drafts a reply to the affected users — closing the loop from user pain
 to remediation.
@@ -72,6 +82,261 @@ For context: a human on-call engineer paged at 2am typically needs tens of
 minutes to read the logs, find the cause, patch, deploy, and verify. These
 figures are for this demo scenario — evidence that the loop closes fast, not a
 universal MTTR claim.
+
+---
+
+## Quickstart — from an empty GCP project to your first autonomous fix
+
+There are two tracks, and the first one is short on purpose.
+
+- **Track A (~15 min)** — deploy the broken demo service, then drive the agent **from
+  your terminal**. The agent itself is not deployed: `autosre run` executes the same
+  ReAct loop locally against your real Cloud Run service and your real Cloud Logging.
+  You get a diagnosis and a real fix PR before committing to any infrastructure.
+- **Track B (~20 min more)** — one `terraform apply` for the full stack, including the
+  autonomous chain: an uptime check notices the 503, an alert publishes to Pub/Sub, and
+  the agent runs **with nobody watching**.
+
+Do Track A first. It proves your billing, quota and credentials work while only two
+things exist.
+
+### What you need
+
+| | |
+|---|---|
+| **GCP project** | with **billing enabled** — Cloud Run and Vertex AI both refuse to start without it |
+| **`gcloud`** | authenticated as a project **Owner** (or Editor + Project IAM Admin) |
+| **Python** | >= 3.10 — Track A |
+| **Terraform** | >= 1.5 — Track B only |
+| **GitHub** | a repo you own for the target's deploy config, and a token with **contents: write** + **pull requests: write** on it |
+| **Time** | ~15 min (A) + ~20 min (B). Most of it is two Cloud Builds and one 5-minute uptime-check period |
+
+**What it costs.** At rest, effectively nothing: both Cloud Run services scale to zero
+and Gemini is only called during a run. One full run measured **~$0.013** (8 LLM calls,
+32k tokens; 2026-08-07, computed from public list prices — not a bill). The uptime
+check, the Scheduler jobs and the Secret Manager secret fit inside the always-free
+tiers. Two things do keep costing after you stop looking, and [Teardown](#teardown)
+turns both off: **Artifact Registry storage** for the two container images (~0.5 GB),
+and — Track B only — the hourly `autosre-demo-rearm` job, which re-breaks the target
+every hour so the demo stays armed.
+
+### Set your placeholders once
+
+Every command below reads these five values. Nothing else in this Quickstart needs
+editing.
+
+```bash
+export PROJECT_ID="your-gcp-project-id"
+export REGION="asia-northeast1"
+export CONFIG_REPO="your-github-user/autosre-target-config"   # created in step 2
+export GITHUB_TOKEN="ghp_..."                                 # contents + PRs: write
+export CONSOLE_KEY="$(python -c 'import secrets; print(secrets.token_hex(24))')"
+```
+
+PowerShell: `$env:PROJECT_ID = "your-gcp-project-id"`, and so on. Every `gcloud`,
+`terraform`, `git` and `autosre` command below is identical on both shells — only the
+`export` lines and the two file-writing heredocs differ.
+
+---
+
+### Track A — diagnose a real incident from your terminal
+
+#### 1. Get the code and the CLI
+
+```bash
+git clone https://github.com/BERORINPO/autosre.git
+cd autosre
+pip install -e packages/agent      # puts `autosre` on PATH
+autosre version
+```
+
+#### 2. Create the config repo the fix PR will edit
+
+The agent does not patch Cloud Run behind your back: it opens a pull request against a
+git repo holding the target's deploy config, and only a merged PR becomes a deployment.
+That repo is yours, and it needs exactly one file.
+
+```bash
+gh repo create "$CONFIG_REPO" --public --clone
+cd "$(basename "$CONFIG_REPO")"
+mkdir -p deploy
+printf '%s\n' \
+  '# Deploy configuration for the demo target service.' \
+  '# DATABASE_URL is deliberately absent. That missing line is the incident.' \
+  'SECRET_KEY=demo-secret-0000-rotate-me' > deploy/target-service.env
+git add deploy && git commit -m "chore: initial target config" && git push
+cd ..
+```
+
+No `gh`? Create the repo in the GitHub UI, add `deploy/target-service.env` with those
+three lines, and commit it on the default branch.
+
+#### 3. Point gcloud at the project and turn on the APIs
+
+```bash
+gcloud auth login
+gcloud auth application-default login     # in Track A the agent runs as *you*
+gcloud config set project "$PROJECT_ID"
+
+gcloud services enable \
+  run.googleapis.com logging.googleapis.com aiplatform.googleapis.com \
+  cloudbuild.googleapis.com artifactregistry.googleapis.com \
+  --project "$PROJECT_ID"
+```
+
+Track A needs those five. Track B enables the rest (Pub/Sub, Monitoring, Scheduler,
+Secret Manager, BigQuery) through Terraform.
+
+#### 4. Deploy the demo target — and break it
+
+The target is an ordinary FastAPI app that is healthy only when `DATABASE_URL` is set.
+You deploy it without one, and that is the entire incident.
+
+```bash
+gcloud run deploy sida-target \
+  --source services/target-service \
+  --project "$PROJECT_ID" --region "$REGION" --allow-unauthenticated
+
+export TARGET_HEALTH_URL="$(gcloud run services describe sida-target \
+  --project "$PROJECT_ID" --region "$REGION" --format='value(status.url)')/health"
+
+curl -s -o /dev/null -w '%{http_code}\n' "$TARGET_HEALTH_URL"    # expect: 503
+```
+
+The first build takes ~4 minutes. A `503` here means the demo is armed correctly — that
+is the failure the agent is about to investigate.
+
+#### 5. Tell the CLI where everything is, then ask it what is still missing
+
+```bash
+export GOOGLE_CLOUD_PROJECT="$PROJECT_ID"
+export GOOGLE_GENAI_USE_VERTEXAI=TRUE     # route Gemini through Vertex, not an API key
+export GOOGLE_CLOUD_LOCATION=global       # Vertex location the live deployment uses
+export RUN_REGION="$REGION"
+export GITHUB_TARGET_REPO="$CONFIG_REPO"
+
+autosre doctor
+```
+
+`doctor` is a checklist, not a smoke test: every failing line carries its own fix,
+secrets are reported as `set (hidden)` and never echoed, and it exits non-zero while
+anything required is missing. Do not go on until it prints `ready:`.
+
+#### 6. Run the loop
+
+```bash
+autosre run --dry-run     # investigate + diagnose, open nothing
+autosre run               # ...and open the real fix PR
+autosre approve <pr>      # the gate: merge, apply to Cloud Run, poll /health until 200
+```
+
+`run` prints each tool call as it happens: the health probe, the real Cloud Logging
+tail, the deployed Cloud Run config, then the diagnosis. `--dry-run` is enforced inside
+`open_pull_request` itself, so a rehearsal cannot leak a PR even if something above it
+misbehaves.
+
+`approve` is the only step that changes anything. It merges the PR you just read,
+patches `DATABASE_URL` back onto the service, and then polls `/health` until it answers
+200 — recovery verified, not assumed. Exit code `3` means the agent refused to act
+because the fix fell outside the remediation allowlist; the full table is in
+[the CLI section](#use-it-from-a-terminal--the-autosre-cli).
+
+That is the whole product loop. Track B changes **who starts it**, and nothing else.
+
+---
+
+### Track B — the autonomous chain, with Terraform
+
+Same repo, from its root.
+
+#### 7. Write your tfvars and create the prerequisites
+
+```bash
+cd terraform
+printf '%s\n' \
+  "project_id         = \"$PROJECT_ID\"" \
+  "region             = \"$REGION\"" \
+  "github_target_repo = \"$CONFIG_REPO\"" \
+  "console_key        = \"$CONSOLE_KEY\"" > terraform.tfvars
+
+terraform init
+terraform apply \
+  -target=google_project_service.required \
+  -target=google_secret_manager_secret.github_pat \
+  -target=google_project_iam_member.runtime_sa_roles
+```
+
+This first, targeted apply exists because the Cloud Run resources cannot come up before
+the images exist and the secret has a value — the next step.
+
+#### 8. Build the agent image and store the token
+
+```bash
+gcloud run deploy sida-agent --source ../packages/agent \
+  --project "$PROJECT_ID" --region "$REGION"
+
+printf '%s' "$GITHUB_TOKEN" | gcloud secrets versions add github-pat \
+  --project "$PROJECT_ID" --data-file=-
+```
+
+The token value never enters Terraform state, by design.
+
+#### 9. Apply the rest
+
+```bash
+terraform apply
+terraform output agent_url
+```
+
+That creates the Pub/Sub topic and its OIDC push subscription, the uptime check, the
+alert policy, the Scheduler jobs, and the IAM that ties them together. Open `agent_url`
+in a browser for the operator console, or keep using the CLI against it:
+
+```bash
+autosre status --remote "$(terraform output -raw agent_url)" --key "$CONSOLE_KEY"
+```
+
+#### 10. Watch it run without you
+
+The target is still missing `DATABASE_URL`, so within one uptime-check period (**~5
+minutes**) the check fails, the alert policy publishes to `autosre-incidents`, the push
+subscription calls the agent with a Google-signed OIDC token, and a run starts with no
+human click. A new PR appears in `$CONFIG_REPO`.
+
+Merge + deploy still wait for you. That line does not move.
+
+---
+
+### Teardown
+
+```bash
+cd terraform && terraform destroy          # everything Track B created
+gcloud run services delete sida-target --project "$PROJECT_ID" --region "$REGION"
+gcloud artifacts repositories delete cloud-run-source-deploy \
+  --project "$PROJECT_ID" --location "$REGION"     # the images: the lingering cost
+```
+
+Pausing the demo rather than removing it: `gcloud scheduler jobs pause
+autosre-demo-rearm --project "$PROJECT_ID" --location "$REGION"` stops the hourly
+re-break, which is the part that accrues cost while you are not looking.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `doctor` reports `GOOGLE_GENAI_USE_VERTEXAI` missing | Without it the Gemini SDK falls back to API-key mode and never reaches Vertex. `export GOOGLE_GENAI_USE_VERTEXAI=TRUE` |
+| `PermissionDenied` reading logs or the service config | Your ADC identity, not the project, is short a role. Grant yourself `roles/logging.viewer`, `roles/run.viewer` and `roles/run.developer` — or run Track A as project Owner |
+| `403 ... API has not been used in project ... or it is disabled` | An API from step 3 was skipped. Re-run that `gcloud services enable` line; enablement can take a minute to propagate |
+| `404` / `NOT_FOUND` from the Gemini model | Wrong Vertex location. This stack uses `GOOGLE_CLOUD_LOCATION=global`, which is **not** the same value as `RUN_REGION` |
+| `gcloud run deploy` fails with a billing error | Billing is not enabled on the project. Cloud Build and Cloud Run both require it, free tier included |
+| The health URL returns `404` instead of `503` | The route is `/health`; `$TARGET_HEALTH_URL` must include it. Step 4 appends it for you |
+| `autosre run` exits `4` | The cost guard blocked the run: cooldown, daily limit, or a tripped kill switch. `autosre status` says which; see [docs/cost-guard-runbook.md](docs/cost-guard-runbook.md) |
+| `autosre run` exits `1` with `undetermined` | The run finished but its answer could not be parsed. That is deliberately not a success — read the printed tool trace to see where it stopped |
+| The PR opens against the wrong repo | `GITHUB_TARGET_REPO` is still the upstream default. It must be **your** repo from step 2 |
+| `terraform apply` 409s on the state bucket | It survives from an earlier run: `terraform import google_storage_bucket.autosre_state ${PROJECT_ID}-autosre-state` |
+| PowerShell: `export` / heredocs do nothing | Use `$env:NAME = "value"`, and write `deploy/target-service.env` and `terraform.tfvars` with an editor instead of the `printf` blocks |
+
+
 
 ---
 
@@ -196,25 +461,6 @@ Exit codes, because this is meant to be scriptable:
 `undetermined` deliberately exits non-zero: a run whose answer could not be parsed is
 not a healthy service. That distinction came from a real production failure — see
 `agents/diagnosis.py`.
-
-## Run the demo
-
-```powershell
-# 1. break the target (removes DATABASE_URL -> /health 503)
-pwsh scripts/target-incident.ps1 -Action inject
-
-# 2. open the console and click "Run AutoSRE", then "Approve & deploy fix"
-#    https://sida-agent-860561433627.asia-northeast1.run.app
-```
-
-The agent investigates the live service, opens a real fix PR, waits for your approval,
-then merges + redeploys the target and confirms `/health` is back to 200.
-
-## Deploy from scratch
-
-See [docs/sprint-4day-autosre.md](docs/sprint-4day-autosre.md) for the full, reproducible
-`gcloud run deploy` commands and the Cloud Run gotchas we hit (reserved `/healthz`,
-PowerShell env-var quoting, Vertex `global` location).
 
 ## Cost guard
 
