@@ -85,5 +85,7 @@ merge PR が 1 日 ~24 本量産される。
 
 - [ ] `GET /guard` で当日の消費を記録 (振り返り用)
 - [ ] 8/19 以降: コンソールキー / GitHub PAT のローテーション (提出時から公開統計に載っている)
+      → 手順は [post-finals-runbook.md](post-finals-runbook.md)。当日オペの巻き戻しは
+      2026-09-01 の実測で**すでに不要**と確認済 (max-instances も Scheduler も正常値)
 
 関連: [cost-guard-runbook.md](cost-guard-runbook.md) (ガードの仕組みと解除手順の詳細)
