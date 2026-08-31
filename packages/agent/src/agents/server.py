@@ -596,6 +596,21 @@ def guard_killswitch(req: KillswitchRequest, request: Request) -> dict:
     return {"ok": ok, "requested": req.tripped, "state": state_store.read_state()}
 
 
+@app.get("/pull-requests")
+def pull_requests(request: Request, limit: int = 10) -> dict:
+    """Open AutoSRE fix PRs - the approval queue, for `autosre watch --remote`.
+
+    The deployed service already holds the GitHub token, so an operator can
+    watch the queue from a laptop that has none. Key-gated like /guard and
+    /trust: which fixes are pending approval is operator data, and the token
+    behind this read can write to the target repo.
+    """
+    _check_console_key(request)
+    from agents.github_tools import list_open_fix_prs
+
+    return list_open_fix_prs(limit=limit)
+
+
 @app.get("/user-reports")
 def user_reports() -> dict:
     """Return recent user-reported problems (for the console's 'user voice' panel)."""

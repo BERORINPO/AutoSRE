@@ -393,6 +393,9 @@ policy publishes to `autosre-incidents`, the push subscription calls the agent w
 Google-signed OIDC token, and a run starts with no human click. A new PR appears in
 `$CONFIG_REPO`.
 
+Leave `autosre watch` open in a second terminal while you wait — the PR shows up in its
+approval queue the moment the unattended run opens it.
+
 Merge + deploy still wait for you. That line does not move.
 
 ---
@@ -514,7 +517,8 @@ considered choice, not a default:
 packages/agent/
   src/agents/
     server.py        FastAPI app: / (console), /incident, /approve, /target-health, /health, /smoke
-    cli.py           the `autosre` command: doctor / run / approve / status
+    cli.py           the `autosre` command: doctor / run / approve / status / watch
+    tui.py           `autosre watch`: the approval queue + trust ledger on one screen
     incident.py      the incident prompt, shared by every entry point
     agent.py         ADK ReAct agent (build_agent, run_incident)
     tools.py         read-only investigation tools (Cloud Run + Logging + health probe)
@@ -545,6 +549,7 @@ autosre run --dry-run           # investigate and diagnose, open no PR
 autosre run                     # ...and open the fix PR for real
 autosre approve 42              # the gate: merge, apply, verify /health is 200 again
 autosre status                  # cost guard budget, trust ledger, target health
+autosre watch                   # the live screen (below)
 ```
 
 `--dry-run` is enforced inside `open_pull_request` — the one function that writes to
@@ -576,6 +581,48 @@ Exit codes, because this is meant to be scriptable:
 `undetermined` deliberately exits non-zero: a run whose answer could not be parsed is
 not a healthy service. That distinction came from a real production failure — see
 `agents/diagnosis.py`.
+
+## Watch it on one screen — `autosre watch`
+
+`status` answers once and scrolls away. `watch` is the same data, live — the screen you
+leave open on a second monitor to see what the agent is waiting for you to decide:
+
+```bash
+autosre watch                   # refreshes every 10s; r reloads, 1-9 open a PR, q quits
+autosre watch --once            # one frame, for a script or a CI log
+autosre watch --interval 30 --remote https://your-agent.run.app --key "$AUTOSRE_CONSOLE_KEY"
+```
+
+```
+AutoSRE watch  sida-target  via local                          target HTTP 503 (down)   20:00:00
+=================================================================================================
+
+awaiting your approval                                            press 1-9 to open in a browser
+-------------------------------------------------------------------------------------------------
+  1  #43  fix: restore DATABASE_URL to recover sida-target   opened 2h ago
+        https://github.com/you/target-config/pull/43
+        autosre approve 43
+
+trust ledger - what may act without a click                      threshold 0.80   autonomy ARMED
+-------------------------------------------------------------------------------------------------
+  restore_env:DATABASE_URL  20/20 verified  [###########|  ] lb 0.84  PROMOTED - acts unattended
+  restore_env:API_KEY         3/3 verified  [######     |  ] lb 0.44  gated - 13 more to promote
+```
+
+The `|` in each bar is the promotion threshold, and `13 more to promote` is the number the
+ledger cannot show on its own: how many further verified recoveries would lift the Wilson
+lower bound over the bar. That is the approval gate's retirement schedule, in runs.
+
+Three properties are deliberate:
+
+- **No dependencies.** Plain ANSI — no `curses` (a third-party wheel on Windows), no
+  `textual`. Nothing to install before you can look at the ledger, and it degrades on its
+  own: a console without ANSI prints scrolling frames, a non-tty prints one frame.
+- **It is never required.** Every panel is a view over what `autosre status --json` and
+  `autosre approve` already do; the screen has no capability the scriptable path lacks.
+- **Off, unreadable and empty stay three different sentences.** A disabled case store
+  renders as *"off (AUTOSRE_CASES_TABLE unset)"*, never as an empty ledger — the same
+  distinction `undetermined` earns in the exit codes.
 
 ## Cost guard
 
