@@ -38,6 +38,7 @@ Thumbs.db
 
 # Cloud / IaC
 .gcloud/
+*.tfvars
 *.tfstate
 *.tfstate.*
 *.tfstate.backup

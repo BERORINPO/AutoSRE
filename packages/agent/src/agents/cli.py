@@ -45,6 +45,7 @@ _SECRET_KEYS = frozenset({"GITHUB_TOKEN", "AUTOSRE_CONSOLE_KEY"})
 # (key, required-for-local, what it is / how to get it)
 _ENV_SPEC = (
     ("GOOGLE_CLOUD_PROJECT", True, "GCP project holding the target service and its logs"),
+    ("GOOGLE_GENAI_USE_VERTEXAI", True, "TRUE sends Gemini through Vertex AI (unset = the SDK wants an API key)"),
     ("TARGET_HEALTH_URL", True, "health endpoint AutoSRE probes (or pass --health-url)"),
     ("GITHUB_TOKEN", True, "token that opens the fix PR (contents+pull_requests write)"),
     ("GITHUB_TARGET_REPO", True, "owner/repo whose config file the fix PR edits"),
