@@ -1,18 +1,21 @@
-name: judging-window-sweep
+name: liveness-sweep
 
-# Daily passive sweep at 09:00 JST, July through August.
+# Daily passive sweep at 09:00 JST, all year.
 #
-# The window used to be the judging period alone (Jul 13-24), which meant the
-# sweep stopped on Jul 25 and would not have run on the Aug 19 finals — the one
-# day the deployment has to be up. External liveness that expires before the
-# event it exists for is not liveness.
+# This window has expired twice. It started as the judging period alone
+# (Jul 13-24), which would have skipped the Aug 19 finals - the one day the
+# deployment had to be up - so it was widened to July-August. That widening
+# then expired on 2026-08-31: the deployment kept running into September with
+# nothing watching it from outside, and the gap was only noticed by reading
+# the cron. A window that has to be renewed is not liveness; it is a reminder
+# nobody set. Hence '* * *' - the sweep now outlives whatever it was for.
 #
 # Complements the 5-min Cloud Monitoring uptime check on /health by also
 # verifying /smoke wiring, target armed state, and the console auth gate.
-# Read-only: no deploys, no writes.
+# Read-only: no deploys, no writes. Free on a public repo; six requests a day.
 on:
   schedule:
-    - cron: '0 0 * 7,8 *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 permissions:
@@ -30,7 +33,7 @@ jobs:
       - name: sweep
         shell: bash
         env:
-          CONSOLE_KEY: ${{ secrets.JUDGING_CONSOLE_KEY }}
+          CONSOLE_KEY: ${{ secrets.SWEEP_CONSOLE_KEY }}
         run: |
           # Failures are accumulated explicitly — disable errexit so one flaky curl
           # can't kill the whole sweep (curl exits 23 when --retry meets a 503).
@@ -67,11 +70,16 @@ jobs:
           c=$(probe -X POST -d '' "$AGENT_URL/reset?key=sweep-invalid-probe")
           [ "$c" = "401" ] && note ":white_check_mark: mutation gate 401 on invalid key (armed)" || { note ":x: mutation gate -> $c on invalid key (expected 401)"; fail=1; }
 
+          # A VALID key must open a gated route. This used to GET "/?key=$CONSOLE_KEY"
+          # and assert 200 - but the console page is served keyless (see above), so it
+          # returned 200 for any key, including a wrong one. It proved nothing.
+          # /guard is key-gated, read-only, and returns the guard state, so a 200 here
+          # means the key this repo holds is the key the deployment is running.
           if [ -n "$CONSOLE_KEY" ]; then
-            c=$(code "$AGENT_URL/?key=$CONSOLE_KEY")
-            [ "$c" = "200" ] && note ":white_check_mark: console with key 200" || { note ":x: console with key -> $c (expected 200)"; fail=1; }
+            c=$(probe --retry 3 --retry-delay 5 -H "Authorization: Bearer $CONSOLE_KEY" "$AGENT_URL/guard")
+            [ "$c" = "200" ] && note ":white_check_mark: valid key opens /guard (200)" || { note ":x: /guard with the stored key -> $c (expected 200; the key may have been rotated without updating this secret)"; fail=1; }
           else
-            note ":warning: JUDGING_CONSOLE_KEY secret not set — skipped keyed console check"
+            note ":warning: SWEEP_CONSOLE_KEY not set - skipped the keyed check (optional: it is the only check that proves the stored key still matches the deployment)"
           fi
 
           meta=$(curl -s --retry 3 --retry-delay 5 --max-time 30 "$AGENT_URL/console-meta" || echo '{}')
